@@ -1,5 +1,9 @@
 # ai-gateway-controller — Design
 
+Architecture decisions are maintained in the
+[Open Data Hub ADR repository](https://github.com/opendatahub-io/architecture-decision-records/tree/main/architecture-decision-records/model-serving)
+so this implementation repository does not carry a second authoritative copy.
+
 ## Status
 
 **Phase 1:** `make build` (tidy, lint, test, binary) passes clean, 94.7%

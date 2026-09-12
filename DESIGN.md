@@ -1,7 +1,8 @@
 # ai-gateway-controller — Design
 
-Architecture decisions are maintained in the
-[Open Data Hub ADR repository](https://github.com/opendatahub-io/architecture-decision-records/tree/main/architecture-decision-records/model-serving)
+Architecture decisions are maintained in the Open Data Hub ADR repository.
+The External Model/Praxis two-plane decision is tracked as
+[ODH-ADR-MS-0005](https://github.com/opendatahub-io/architecture-decision-records/pull/165),
 so this implementation repository does not carry a second authoritative copy.
 
 ## Status

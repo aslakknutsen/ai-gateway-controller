@@ -52,7 +52,7 @@ func aitenantSchemeForTests() *runtime.Scheme {
 }
 
 // newAITenant builds an unstructured AITenant fixture. payloadProcessingType
-// set to "" omits AnnotationPayloadProcessingType entirely; phase set to ""
+// set to "" omits MaaS's selector annotation; phase set to ""
 // omits status.phase.
 func newAITenant(name, payloadProcessingType, phase, gatewayName, gatewayNamespace string) *unstructured.Unstructured {
 	u := NewAITenant()
@@ -66,6 +66,7 @@ func newAITenant(name, payloadProcessingType, phase, gatewayName, gatewayNamespa
 	}
 	if gatewayName != "" || gatewayNamespace != "" {
 		status["gatewayRef"] = map[string]any{"name": gatewayName, "namespace": gatewayNamespace}
+		status["tenantNamespace"] = gatewayNamespace
 	}
 	u.Object["status"] = status
 	return u
@@ -153,6 +154,28 @@ func TestReconcileSkipsWhenAITenantNotFound(t *testing.T) {
 	}
 }
 
+func TestWaitForForeignOwnershipDoesNotTakeOverExistingObject(t *testing.T) {
+	deployment := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "apps/v1",
+		"kind":       "Deployment",
+		"metadata": map[string]any{
+			"name":      "payload-processing-transition",
+			"namespace": "maas-system",
+			"labels": map[string]any{
+				"app.kubernetes.io/managed-by": "ipp-external-model-reconciler",
+			},
+		},
+	}}
+	deployment.SetGroupVersionKind(schema.GroupVersionKind{Group: "apps", Version: "v1", Kind: "Deployment"})
+	fakeClient := fake.NewClientBuilder().WithScheme(aitenantSchemeForTests()).WithObjects(deployment).Build()
+	r := &Reconciler{Client: fakeClient}
+	desired := deployment.DeepCopy()
+	desired.SetLabels(map[string]string{"app.kubernetes.io/managed-by": render.FieldOwner})
+	if err := r.waitForForeignOwnership(context.Background(), []unstructured.Unstructured{*desired}); err == nil {
+		t.Fatal("waitForForeignOwnership accepted an object owned by the IPP reconciler")
+	}
+}
+
 func TestReconcileSkipsWhenNotUsingPraxis(t *testing.T) {
 	scheme := aitenantSchemeForTests()
 	aitenant := newAITenant("redteam", "", "", "", "")
@@ -233,6 +256,27 @@ func TestReconcileWaitsForMigrationMarkerBeforeApply(t *testing.T) {
 	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(aitenant).WithInterceptorFuncs(rec.funcs()).Build()
 
 	r := &Reconciler{Client: fakeClient, ManifestPath: manifestPath, Image: "img", ResyncInterval: time.Minute}
+ 	res, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKey{Name: "redteam"}})
+ 	if err != nil {
+ 		t.Fatalf("Reconcile: %v", err)
+ 	}
+ 	if res.RequeueAfter != notReadyRequeueInterval {
+ 		t.Fatalf("RequeueAfter = %v, want %v", res.RequeueAfter, notReadyRequeueInterval)
+ 	}
+ 	names, _, _ := rec.snapshot()
+ 	if len(names) != 0 {
+ 		t.Fatalf("expected no praxis apply before migration marker, got %v", names)
+ 	}
+}
+
+func TestReconcileWaitsForResolvedTenantNamespace(t *testing.T) {
+	scheme := aitenantSchemeForTests()
+	aitenant := newAITenant("redteam", PayloadProcessingBackendPraxis, AITenantPhaseActive, "my-gateway", "gateway-ns")
+	delete(aitenant.Object["status"].(map[string]any), "tenantNamespace")
+	rec := &recorder{}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(aitenant).WithInterceptorFuncs(rec.funcs()).Build()
+
+	r := &Reconciler{Client: fakeClient, ManifestPath: manifestPath, Image: "img", ResyncInterval: time.Hour}
 	res, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKey{Name: "redteam"}})
 	if err != nil {
 		t.Fatalf("Reconcile: %v", err)
@@ -240,9 +284,9 @@ func TestReconcileWaitsForMigrationMarkerBeforeApply(t *testing.T) {
 	if res.RequeueAfter != notReadyRequeueInterval {
 		t.Fatalf("RequeueAfter = %v, want %v", res.RequeueAfter, notReadyRequeueInterval)
 	}
-	names, _, _ := rec.snapshot()
-	if len(names) != 0 {
-		t.Fatalf("expected no praxis apply before migration marker, got %v", names)
+	patched, _, deleted := rec.snapshot()
+	if len(patched) != 0 || len(deleted) != 0 {
+		t.Fatalf("expected no resource changes before status.tenantNamespace, got patched=%v deleted=%v", patched, deleted)
 	}
 }
 

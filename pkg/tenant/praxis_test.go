@@ -82,8 +82,8 @@ func TestStandalonePraxisResourcesProjectAndDeduplicateCredentials(t *testing.T)
 	if strings.Contains(config, "secret-value") || !strings.Contains(config, "/etc/praxis/credentials/shared-") {
 		t.Fatalf("config contains unexpected credential material or path: %s", config)
 	}
-	if !strings.Contains(config, "provider-a\n            endpoints: [\"a.example.com:443\"]") ||
-		!strings.Contains(config, "provider-b\n            endpoints: [\"b.example.com:443\"]") {
+	if !strings.Contains(config, "endpoints: [\"a.example.com:443\"]") ||
+		!strings.Contains(config, "endpoints: [\"b.example.com:443\"]") {
 		t.Fatalf("Praxis config did not preserve declared provider endpoints: %s", config)
 	}
 }
@@ -114,6 +114,84 @@ func TestStandalonePraxisResourcesUsesExternalProviderEndpoint(t *testing.T) {
 	}
 	if strings.Contains(data["config.yaml"], "provider-b.tenant-a.svc.cluster.local") {
 		t.Fatalf("config synthesized a tenant-local endpoint: %s", data["config.yaml"])
+	}
+}
+
+func TestStandalonePraxisResourcesConfiguresTLSAndAuthorityForExternalEndpoint(t *testing.T) {
+	providers := []v1alpha1.ExternalProvider{{
+		ObjectMeta: metav1.ObjectMeta{Name: "openai", Namespace: "tenant-a"},
+		Spec:       v1alpha1.ExternalProviderSpec{Provider: "openai", Endpoint: "api.openai.com", Auth: v1alpha1.AuthConfig{SecretRef: v1alpha1.NameReference{Name: "credentials"}}},
+	}}
+	resources, err := StandalonePraxisResources("tenant-a", "tenant-a", "praxis:test", "Never", providers)
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := findResource(resources, "ConfigMap", "praxis-config-tenant-a")
+	data, _, err := unstructured.NestedStringMap(config.Object, "data")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "            http:\n              authority: \"api.openai.com\"\n            tls:\n              sni: \"api.openai.com\"\n            endpoints: [\"api.openai.com:443\"]"
+	if !strings.Contains(data["config.yaml"], want) {
+		t.Fatalf("external provider config missing verified TLS and authority:\n%s", data["config.yaml"])
+	}
+}
+
+func TestStandalonePraxisResourcesSeparatesExplicitPortFromSNI(t *testing.T) {
+	providers := []v1alpha1.ExternalProvider{{
+		ObjectMeta: metav1.ObjectMeta{Name: "provider", Namespace: "tenant-a"},
+		Spec:       v1alpha1.ExternalProviderSpec{Endpoint: "provider.example.com:8443"},
+	}}
+	resources, err := StandalonePraxisResources("tenant-a", "tenant-a", "praxis:test", "Never", providers)
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := findResource(resources, "ConfigMap", "praxis-config-tenant-a")
+	data, _, err := unstructured.NestedStringMap(config.Object, "data")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "            http:\n              authority: \"provider.example.com:8443\"\n            tls:\n              sni: \"provider.example.com\"\n            endpoints: [\"provider.example.com:8443\"]"
+	if !strings.Contains(data["config.yaml"], want) {
+		t.Fatalf("explicit provider port leaked into TLS SNI:\n%s", data["config.yaml"])
+	}
+}
+
+func TestStandalonePraxisResourcesUsesExplicitPlaintextFixtureException(t *testing.T) {
+	providers := []v1alpha1.ExternalProvider{{
+		ObjectMeta: metav1.ObjectMeta{Name: "provider-a", Namespace: "tenant-a"},
+		Spec:       v1alpha1.ExternalProviderSpec{Endpoint: "provider-a.maas-system.svc.cluster.local"},
+	}}
+	resources, err := StandalonePraxisResourcesWithOptions("tenant-a", "tenant-a", "praxis:test", "Never", providers, PraxisTransportOptions{PlaintextClusters: map[string]struct{}{"provider-provider-a": {}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := findResource(resources, "ConfigMap", "praxis-config-tenant-a")
+	data, _, err := unstructured.NestedStringMap(config.Object, "data")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(data["config.yaml"], "tls:") || strings.Contains(data["config.yaml"], "authority:") {
+		t.Fatalf("in-cluster fixture unexpectedly configured TLS or authority:\n%s", data["config.yaml"])
+	}
+}
+
+func TestStandalonePraxisResourcesUsesTLSByDefaultForServiceDNS(t *testing.T) {
+	providers := []v1alpha1.ExternalProvider{{
+		ObjectMeta: metav1.ObjectMeta{Name: "provider-a", Namespace: "tenant-a"},
+		Spec:       v1alpha1.ExternalProviderSpec{Endpoint: "provider-a.maas-system.svc.cluster.local"},
+	}}
+	resources, err := StandalonePraxisResources("tenant-a", "tenant-a", "praxis:test", "Never", providers)
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := findResource(resources, "ConfigMap", "praxis-config-tenant-a")
+	data, _, err := unstructured.NestedStringMap(config.Object, "data")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(data["config.yaml"], "sni: \"provider-a.maas-system.svc.cluster.local\"") {
+		t.Fatalf("service DNS endpoint did not default to verified TLS:\n%s", data["config.yaml"])
 	}
 }
 

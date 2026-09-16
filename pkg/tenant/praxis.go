@@ -5,6 +5,8 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net"
+	"net/url"
 	"sort"
 	"strings"
 
@@ -19,6 +21,7 @@ const (
 	praxisConfigMapName  = "praxis-config"
 	praxisServiceAccount = "praxis"
 	praxisOverlayName    = "routing-overlay"
+	praxisOverlayDataKey = "routing-overlay.json"
 	praxisCredentialDir  = "/etc/praxis/credentials" //nolint:gosec // fixed non-secret mount path
 )
 
@@ -29,10 +32,23 @@ type praxisCredential struct {
 	Path      string
 }
 
+// PraxisTransportOptions contains explicit transport exceptions for test
+// fixtures. Providers use verified TLS by default; a plaintext cluster must
+// be named deliberately by the controller's test-only flag.
+type PraxisTransportOptions struct {
+	PlaintextClusters map[string]struct{}
+}
+
 // StandalonePraxisResources renders the tenant-owned Praxis proxy and its
 // reference-only configuration. Secret bytes are never read or copied; the
 // projected volume is populated by kubelet from the provider namespace.
 func StandalonePraxisResources(tenantID, namespace, image, imagePullPolicy string, providers []v1alpha1.ExternalProvider) ([]unstructured.Unstructured, error) {
+	return StandalonePraxisResourcesWithOptions(tenantID, namespace, image, imagePullPolicy, providers, PraxisTransportOptions{})
+}
+
+// StandalonePraxisResourcesWithOptions renders the tenant-owned Praxis proxy
+// with the explicit transport exceptions supplied by the caller.
+func StandalonePraxisResourcesWithOptions(tenantID, namespace, image, imagePullPolicy string, providers []v1alpha1.ExternalProvider, transport PraxisTransportOptions) ([]unstructured.Unstructured, error) {
 	if namespace == "" {
 		return nil, errors.New("praxis namespace is required")
 	}
@@ -59,7 +75,10 @@ func StandalonePraxisResources(tenantID, namespace, image, imagePullPolicy strin
 		"app.kubernetes.io/managed-by": "ai-gateway-controller",
 		LabelTenantInstance:            ResourceName(praxisDeploymentName, tenantID),
 	}
-	config := praxisConfig(credentials, providers)
+	config, err := praxisConfig(credentials, providers, transport)
+	if err != nil {
+		return nil, err
+	}
 	return []unstructured.Unstructured{
 		{Object: map[string]any{
 			"apiVersion": "v1", "kind": "ServiceAccount",
@@ -86,14 +105,37 @@ func StandalonePraxisResources(tenantID, namespace, image, imagePullPolicy strin
 }
 
 func validatePraxisEndpoint(endpoint string) error {
+	_, err := parsePraxisEndpoint(endpoint)
+	return err
+}
+
+type praxisEndpoint struct {
+	Authority string
+	Dial      string
+	Host      string
+}
+
+func parsePraxisEndpoint(endpoint string) (praxisEndpoint, error) {
 	endpoint = strings.TrimSpace(endpoint)
 	if endpoint == "" {
-		return errors.New("provider endpoint is required")
+		return praxisEndpoint{}, errors.New("provider endpoint is required")
 	}
 	if strings.ContainsAny(endpoint, " /\t\r\n") || strings.Contains(endpoint, "://") {
-		return fmt.Errorf("provider endpoint %q must be a host or host:port", endpoint)
+		return praxisEndpoint{}, fmt.Errorf("provider endpoint %q must be a host or host:port", endpoint)
 	}
-	return nil
+	parsed, err := url.Parse("https://" + endpoint)
+	if err != nil || parsed.User != nil || parsed.Hostname() == "" || parsed.Path != "" || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return praxisEndpoint{}, fmt.Errorf("provider endpoint %q must be a host or host:port", endpoint)
+	}
+	port := parsed.Port()
+	if port == "" {
+		port = "443"
+	}
+	return praxisEndpoint{
+		Authority: parsed.Host,
+		Dial:      net.JoinHostPort(parsed.Hostname(), port),
+		Host:      parsed.Hostname(),
+	}, nil
 }
 
 func praxisCredentials(namespace string, providers []v1alpha1.ExternalProvider) ([]praxisCredential, error) {
@@ -124,7 +166,7 @@ func praxisCredentials(namespace string, providers []v1alpha1.ExternalProvider) 
 	return credentials, nil
 }
 
-func praxisConfig(credentials []praxisCredential, providers []v1alpha1.ExternalProvider) string {
+func praxisConfig(credentials []praxisCredential, providers []v1alpha1.ExternalProvider, transport PraxisTransportOptions) (string, error) {
 	var b strings.Builder
 	b.WriteString("listeners:\n")
 	b.WriteString("  - name: proxy\n    address: \"0.0.0.0:8080\"\n    filter_chains: [main]\n")
@@ -151,14 +193,21 @@ func praxisConfig(credentials []praxisCredential, providers []v1alpha1.ExternalP
 		// Service name from the tenant namespace silently creates an endpoint
 		// that Praxis cannot resolve.  Keep the overlay reference-only and add
 		// the TLS port when the CRD endpoint omits it.
-		endpoint := strings.TrimSpace(provider.Spec.Endpoint)
-		if !strings.Contains(endpoint, ":") {
-			endpoint += ":443"
+		endpoint, err := parsePraxisEndpoint(provider.Spec.Endpoint)
+		if err != nil {
+			return "", fmt.Errorf("provider %s endpoint: %w", provider.Name, err)
 		}
-		fmt.Fprintf(&b, "          - name: provider-%s\n            endpoints: [\"%s\"]\n", provider.Name, endpoint)
+		fmt.Fprintf(&b, "          - name: provider-%s\n", provider.Name)
+		clusterName := "provider-" + provider.Name
+		if _, plaintext := transport.PlaintextClusters[clusterName]; !plaintext {
+			// ExternalProvider endpoints use verified TLS unless the caller has
+			// explicitly named this fixture cluster as plaintext.
+			fmt.Fprintf(&b, "            http:\n              authority: %q\n            tls:\n              sni: %q\n", endpoint.Authority, endpoint.Host)
+		}
+		fmt.Fprintf(&b, "            endpoints: [%q]\n", endpoint.Dial)
 	}
 	b.WriteString("admin: {address: \"127.0.0.1:9901\"}\ninsecure_options: {allow_private_endpoints: true}\n")
-	return b.String()
+	return b.String(), nil
 }
 
 func praxisDeployment(namespace, tenantID, image, imagePullPolicy string, labels map[string]any, credentials []praxisCredential) map[string]any {

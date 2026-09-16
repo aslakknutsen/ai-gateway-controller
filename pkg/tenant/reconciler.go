@@ -18,6 +18,7 @@ package tenant
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -34,6 +35,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	v1alpha1 "github.com/opendatahub-io/ai-gateway-controller/api/inference/v1alpha1"
+	"github.com/opendatahub-io/ai-gateway-controller/pkg/envelope"
 	"github.com/opendatahub-io/ai-gateway-controller/pkg/render"
 )
 
@@ -67,6 +69,9 @@ type Reconciler struct {
 	// PraxisImagePullPolicy controls image pulling for the standalone Praxis
 	// Deployment. Production defaults to IfNotPresent; local Kind can use Never.
 	PraxisImagePullPolicy string
+	// PraxisPlaintextClusters names test-only Praxis clusters that intentionally
+	// speak plaintext. All other provider clusters use verified TLS.
+	PraxisPlaintextClusters map[string]struct{}
 	// MaaSAPIRouteNameBase is the base name used to disable ext_proc on
 	// maas-api's own HTTPRoute rules; suffixed per tenant like every other
 	// resource this package renames.
@@ -262,7 +267,7 @@ func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, aiten
 	if praxisImage == "" {
 		praxisImage = "quay.io/opendatahub/praxis-ai:odh-stable"
 	}
-	praxisResources, err := StandalonePraxisResources(tenantID, tenantNamespace, praxisImage, r.PraxisImagePullPolicy, providers)
+	praxisResources, err := StandalonePraxisResourcesWithOptions(tenantID, tenantNamespace, praxisImage, r.PraxisImagePullPolicy, providers, PraxisTransportOptions{PlaintextClusters: r.PraxisPlaintextClusters})
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("render standalone praxis: %w", err)
 	}
@@ -280,14 +285,88 @@ func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, aiten
 		log.Info("praxis-extproc resources are still owned by another controller; waiting for handoff", "error", err)
 		return ctrl.Result{RequeueAfter: notReadyRequeueInterval}, nil
 	}
-	if err := render.Apply(ctx, r.Client, resources); err != nil {
+	overlayReady, overlayReason, err := r.routingOverlayReady(ctx, tenantNamespace, providers)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	resourcesToApply := resources
+	if !overlayReady {
+		// Praxis exits if its optional routing volume is absent. Apply the
+		// static resources and credential projections first, but defer the
+		// standalone Praxis Deployment until the routing reconciler has
+		// published a controller-owned, digest-valid overlay. This keeps the
+		// overlay single-writer and preserves an existing ready Deployment
+		// when a new overlay is not yet available.
+		resourcesToApply = make([]unstructured.Unstructured, 0, len(resources))
+		praxisDeployment := ResourceName(praxisDeploymentName, tenantID)
+		for _, resource := range resources {
+			if resource.GetKind() == "Deployment" && resource.GetName() == praxisDeployment && resource.GetNamespace() == tenantNamespace {
+				continue
+			}
+			resourcesToApply = append(resourcesToApply, resource)
+		}
+	}
+	if err := render.Apply(ctx, r.Client, resourcesToApply); err != nil {
 		log.Error(err, "praxis-extproc apply failed for tenant; will retry")
 		return ctrl.Result{}, fmt.Errorf("apply: %w", err)
+	}
+	if !overlayReady {
+		log.Info("deferring standalone Praxis Deployment until routing overlay is ready", "namespace", tenantNamespace, "reason", overlayReason)
+		return ctrl.Result{RequeueAfter: notReadyRequeueInterval}, nil
 	}
 
 	log.Info("praxis-extproc install applied",
 		"tenantID", tenantID, "namespace", gatewayNamespace, "gatewayName", gatewayName)
 	return ctrl.Result{RequeueAfter: r.ResyncInterval}, nil
+}
+
+// routingOverlayReady accepts only the current controller's published
+// envelope. The overlay is the sole readiness gate for a new Praxis
+// Deployment: a missing, foreign, malformed, stale, or cross-namespace
+// envelope must not allow Praxis to start without its routing file.
+func (r *Reconciler) routingOverlayReady(ctx context.Context, namespace string, providers []v1alpha1.ExternalProvider) (bool, string, error) {
+	var configMap corev1.ConfigMap
+	if err := r.Client.Get(ctx, client.ObjectKey{Namespace: namespace, Name: praxisOverlayName}, &configMap); err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, "routing overlay is absent", nil
+		}
+		return false, "", fmt.Errorf("get routing overlay %s/%s: %w", namespace, praxisOverlayName, err)
+	}
+	if configMap.GetLabels()[managedByLabel] != render.FieldOwner {
+		return false, "routing overlay is not owned by ai-gateway-controller", nil
+	}
+	raw, ok := configMap.Data[praxisOverlayDataKey]
+	if !ok || raw == "" {
+		return false, "routing overlay has no envelope data", nil
+	}
+	var env envelope.Envelope
+	if decodeErr := json.Unmarshal([]byte(raw), &env); decodeErr != nil {
+		return overlayNotReady("routing overlay is not valid JSON")
+	}
+	if env.SchemaVersion == "" || env.Revision.Value == "" || env.ContentDigest.Value != env.Revision.Value || env.Scope.Namespace != namespace {
+		return false, "routing overlay envelope metadata is invalid", nil
+	}
+	digest, digestErr := envelope.ComputeDigestFromWire([]byte(raw))
+	if digestErr != nil {
+		return overlayNotReady("routing overlay digest cannot be computed")
+	}
+	if digest != env.Revision.Value {
+		return false, "routing overlay digest does not match its declared revision", nil
+	}
+	available := make(map[string]bool, len(env.Overlay.Candidates))
+	for _, candidate := range env.Overlay.Candidates {
+		available[candidate.Cluster] = true
+	}
+	for _, provider := range providers {
+		if !available["provider-"+provider.Name] {
+			return false, fmt.Sprintf("routing overlay does not contain provider %s", provider.Name), nil
+		}
+	}
+	return true, "routing overlay is controller-owned and digest-valid", nil
+}
+
+func overlayNotReady(reason string) (bool, string, error) {
+	return false, reason, nil
 }
 
 const managedByLabel = "app.kubernetes.io/managed-by"

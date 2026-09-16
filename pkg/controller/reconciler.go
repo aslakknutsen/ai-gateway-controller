@@ -503,7 +503,7 @@ func (r *Reconciler) cleanupOverlay(ctx context.Context, namespace string) error
 
 func (r *Reconciler) praxisTenantForNamespace(ctx context.Context, namespace string) (*unstructured.Unstructured, bool, error) {
 	var tenants unstructured.UnstructuredList
-	tenants.SetGroupVersionKind(tenant.AITenantGVK)
+	tenants.SetGroupVersionKind(tenant.AITenantGVK.GroupVersion().WithKind("AITenantList"))
 	if err := r.List(ctx, &tenants); err != nil {
 		return nil, false, fmt.Errorf("list AITenants: %w", err)
 	}

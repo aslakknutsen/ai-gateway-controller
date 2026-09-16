@@ -57,6 +57,7 @@ func main() {
 		network               string
 		localSite             string
 		knownClusters         []string
+		plaintextClusters     []string
 	)
 
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metrics endpoint binds to.")
@@ -90,6 +91,10 @@ func main() {
 		knownClusters = append(knownClusters, value)
 		return nil
 	})
+	flag.Func("praxis-plaintext-cluster", "Test-only explicit plaintext Praxis cluster exception; repeat as needed. All omitted clusters use verified TLS.", func(value string) error {
+		plaintextClusters = append(plaintextClusters, value)
+		return nil
+	})
 
 	opts := zap.Options{}
 	if err := applyLogDevelopment(&opts, os.Stderr); err != nil {
@@ -97,6 +102,18 @@ func main() {
 	}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
+	knownClusterSet := make(map[string]struct{}, len(knownClusters))
+	for _, cluster := range knownClusters {
+		knownClusterSet[cluster] = struct{}{}
+	}
+	plaintextClusterSet := make(map[string]struct{}, len(plaintextClusters))
+	for _, cluster := range plaintextClusters {
+		if _, ok := knownClusterSet[cluster]; !ok {
+			fmt.Fprintf(os.Stderr, "invalid transport configuration: plaintext Praxis cluster %q is not in --known-cluster\n", cluster)
+			os.Exit(1)
+		}
+		plaintextClusterSet[cluster] = struct{}{}
+	}
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 	if err := inferencev1alpha1.AddToScheme(clientgoscheme.Scheme); err != nil {
@@ -133,15 +150,16 @@ func main() {
 	}
 
 	reconciler := &tenant.Reconciler{
-		Client:                mgr.GetClient(),
-		ManifestPath:          manifestPath,
-		Image:                 image,
-		PraxisImage:           praxisImage,
-		PraxisImagePullPolicy: praxisImagePullPolicy,
-		MaaSAPIRouteNameBase:  maasAPIRouteName,
-		ResyncInterval:        resyncInterval,
-		DeletionTimeout:       deletionTimeout,
-		Log:                   ctrl.Log.WithName("tenant"),
+		Client:                  mgr.GetClient(),
+		ManifestPath:            manifestPath,
+		Image:                   image,
+		PraxisImage:             praxisImage,
+		PraxisImagePullPolicy:   praxisImagePullPolicy,
+		PraxisPlaintextClusters: plaintextClusterSet,
+		MaaSAPIRouteNameBase:    maasAPIRouteName,
+		ResyncInterval:          resyncInterval,
+		DeletionTimeout:         deletionTimeout,
+		Log:                     ctrl.Log.WithName("tenant"),
 	}
 	if err := reconciler.SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to set up AITenant reconciler")

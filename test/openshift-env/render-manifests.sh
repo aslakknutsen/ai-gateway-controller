@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 TEMPLATE_DIR="$ROOT/test/openshift-env/manifests"
+SHARED_TEMPLATE_DIR="$ROOT/test/external-model"
 command -v envsubst >/dev/null || { echo "gettext (envsubst) is required; install the gettext package" >&2; exit 1; }
 OUTPUT_DIR=${1:-"${OPENSHIFT_E2E_STATE:-$ROOT/.openshift-state}/rendered-manifests"}
 if (($# > 0)); then
@@ -40,7 +41,9 @@ declare -A ALLOWLIST=(
   [30-provider-fixtures.yaml.tmpl]='${OPENSHIFT_E2E_BACKEND_NAMESPACE} ${OPENSHIFT_E2E_RUN_ID} ${KATAN_IMAGE}'
   [40-model-fixtures.yaml.tmpl]='${OPENSHIFT_E2E_TENANT_NAMESPACE} ${OPENSHIFT_E2E_BACKEND_NAMESPACE} ${OPENSHIFT_E2E_RUN_ID}'
   [50-maas-fixtures.yaml.tmpl]='${OPENSHIFT_E2E_TENANT_NAMESPACE} ${OPENSHIFT_E2E_RUN_ID} ${OPENSHIFT_E2E_USER}'
-  [60-client.yaml.tmpl]='${OPENSHIFT_E2E_TENANT_NAMESPACE} ${OPENSHIFT_E2E_RUN_ID} ${CLIENT_CA_CONFIGMAP}'
+  [providers.yaml.tmpl]='${EXTERNAL_MODEL_NAMESPACE} ${EXTERNAL_MODEL_PROVIDER_A_ENDPOINT} ${EXTERNAL_MODEL_PROVIDER_B_ENDPOINT} ${EXTERNAL_MODEL_RUN_ID}'
+  [openai.yaml.tmpl]='${EXTERNAL_MODEL_NAMESPACE} ${EXTERNAL_MODEL_OPENAI_SECRET} ${EXTERNAL_MODEL_OPENAI_SUBSCRIPTION} ${EXTERNAL_MODEL_OPENAI_POLICY} ${EXTERNAL_MODEL_OPENAI_USER} ${EXTERNAL_MODEL_RUN_ID}'
+  [client.yaml.tmpl]='${EXTERNAL_MODEL_CLIENT_NAME} ${EXTERNAL_MODEL_CLIENT_NAMESPACE} ${EXTERNAL_MODEL_CLIENT_IMAGE} ${EXTERNAL_MODEL_CLIENT_VOLUME_MOUNTS} ${EXTERNAL_MODEL_CLIENT_VOLUMES} ${EXTERNAL_MODEL_RUN_ID}'
 )
 
 templates=("$@")
@@ -48,8 +51,12 @@ if ((${#templates[@]} == 0)); then
   templates=("$TEMPLATE_DIR"/*.yaml.tmpl)
 else
   for index in "${!templates[@]}"; do
-    # shellcheck disable=SC2004
-    templates[$index]="$TEMPLATE_DIR/${templates[$index]}"
+    requested=${templates[$index]}
+    if [[ -f "$TEMPLATE_DIR/$requested" ]]; then
+      templates[index]="$TEMPLATE_DIR/$requested"
+    else
+      templates[index]="$SHARED_TEMPLATE_DIR/$requested"
+    fi
   done
 fi
 for template in "${templates[@]}"; do

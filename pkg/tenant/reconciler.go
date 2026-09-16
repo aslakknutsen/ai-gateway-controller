@@ -231,6 +231,12 @@ func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, aiten
 		return ctrl.Result{}, fmt.Errorf("list tenant ExternalModels: %w", err)
 	}
 	referencedProviders := map[string]bool{}
+	// The static Praxis configuration includes every referenced provider so
+	// that a later weight change can reuse the same transport. The routing
+	// overlay, however, intentionally omits refs whose weight disables them.
+	// Keep the rollout gate aligned with the eligible candidate set rather than
+	// requiring disabled providers to appear in the published overlay.
+	requiredOverlayProviders := map[string]bool{}
 	for i := range modelList.Items {
 		refs, found, err := unstructured.NestedSlice(modelList.Items[i].Object, "spec", "externalProviderRefs")
 		if err != nil {
@@ -250,6 +256,13 @@ func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, aiten
 			}
 			if name != "" {
 				referencedProviders[name] = true
+				weight, found, err := unstructured.NestedInt64(ref, "weight")
+				if err != nil {
+					return ctrl.Result{}, fmt.Errorf("read provider weight in ExternalModel %s: %w", modelList.Items[i].GetName(), err)
+				}
+				if !found || weight > 0 {
+					requiredOverlayProviders[name] = true
+				}
 			}
 		}
 	}
@@ -285,7 +298,7 @@ func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, aiten
 		log.Info("praxis-extproc resources are still owned by another controller; waiting for handoff", "error", err)
 		return ctrl.Result{RequeueAfter: notReadyRequeueInterval}, nil
 	}
-	overlayReady, overlayReason, err := r.routingOverlayReady(ctx, tenantNamespace, providers)
+	overlayReady, overlayReason, err := r.routingOverlayReady(ctx, tenantNamespace, requiredOverlayProviders)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -324,7 +337,7 @@ func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, aiten
 // envelope. The overlay is the sole readiness gate for a new Praxis
 // Deployment: a missing, foreign, malformed, stale, or cross-namespace
 // envelope must not allow Praxis to start without its routing file.
-func (r *Reconciler) routingOverlayReady(ctx context.Context, namespace string, providers []v1alpha1.ExternalProvider) (bool, string, error) {
+func (r *Reconciler) routingOverlayReady(ctx context.Context, namespace string, requiredProviders map[string]bool) (bool, string, error) {
 	var configMap corev1.ConfigMap
 	if err := r.Client.Get(ctx, client.ObjectKey{Namespace: namespace, Name: praxisOverlayName}, &configMap); err != nil {
 		if apierrors.IsNotFound(err) {
@@ -357,9 +370,9 @@ func (r *Reconciler) routingOverlayReady(ctx context.Context, namespace string, 
 	for _, candidate := range env.Overlay.Candidates {
 		available[candidate.Cluster] = true
 	}
-	for _, provider := range providers {
-		if !available["provider-"+provider.Name] {
-			return false, fmt.Sprintf("routing overlay does not contain provider %s", provider.Name), nil
+	for provider := range requiredProviders {
+		if !available["provider-"+provider] {
+			return false, fmt.Sprintf("routing overlay does not contain provider %s", provider), nil
 		}
 	}
 	return true, "routing overlay is controller-owned and digest-valid", nil

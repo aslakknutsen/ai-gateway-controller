@@ -45,6 +45,47 @@ separately. The extended run sends positive tenant-B traffic and verifies it
 survives tenant-A mutation. A separate `ai-tenant-transition` fixture is
 annotation absent and reserved for real MaaS IPP cutover/rollback qualification.
 
+### Shared External Model resources
+
+The reusable Provider A/B identities, optional `gpt-4o-mini` OpenAI CR chain,
+persistent in-cluster client base, and credential-safe request helper live in
+`test/external-model/`. The Kind harness renders these resources with explicit
+test-only values. Katan remains a Kind-only plaintext fixture and the Gateway
+client uses the Kind HTTP Service; OpenShift keeps its service-ca-backed Katan
+HTTPS and public Gateway TLS configuration.
+
+The OpenAI CR chain is opt-in only and is never included by the base manifest
+application glob. It contains Secret references, not credential values.
+
+For a fresh cold validation, use a unique cluster and evidence root:
+
+```sh
+LOCAL_ENV_CLUSTER=external-model-kind-<run-id> \
+LOCAL_ENV_EVIDENCE_ROOT="$PWD/evidence/<run-id>" ./run.sh --destroy || true
+LOCAL_ENV_CLUSTER=external-model-kind-<run-id> \
+LOCAL_ENV_EVIDENCE_ROOT="$PWD/evidence/<run-id>" ./run.sh --provision
+LOCAL_ENV_CLUSTER=external-model-kind-<run-id> ./e2e.sh
+./demo.sh --context kind-external-model-kind-<run-id> --non-interactive
+LOCAL_ENV_CLUSTER=external-model-kind-<run-id> \
+LOCAL_ENV_EVIDENCE_ROOT="$PWD/evidence/<run-id>" ./run.sh --destroy
+```
+
+Replace `<run-id>` consistently. The normal qualification does not apply the
+optional OpenAI resources; that workflow must opt in explicitly through its
+documented OpenAI command path.
+
+### Shared External Model resources
+
+The reusable Provider A/B identities, optional `gpt-4o-mini` OpenAI CR chain,
+persistent in-cluster client base, and credential-safe request helper live in
+`test/external-model/`. The Kind harness renders these resources with explicit
+test-only values. Katan remains a Kind-only plaintext fixture and the Gateway
+client uses the Kind HTTP Service; OpenShift keeps its service-ca-backed Katan
+HTTPS and public Gateway TLS configuration.
+
+The OpenAI CR chain is opt-in only and is never included by the base manifest
+application glob. It contains Secret references, not credential values.
+
 ### Namespace boundaries
 
 The production-shaped split is deliberate:
@@ -144,9 +185,10 @@ Deployment, the Kind provisioner applies the fixture-only numeric identity
 transform is not in production manifests and is not used by the OpenShift
 workflow.
 The run-owned Katan Services expose port 443 mapped to their plain HTTP 8000
-listener solely so the test backend satisfies the controller's HTTPS-shaped
-ExternalName target; the production ServiceEntry/DestinationRule contract is
-unchanged.
+listener. The Kind controller invocation names those fixture clusters
+explicitly with repeated `--praxis-plaintext-cluster` flags. The controller
+defaults every omitted Praxis cluster to verified TLS; there is no implicit
+Service-DNS or hostname-based downgrade.
 
 The Katan backends are credential-enforcing fixtures, not permissive traffic
 sinks. Praxis providers use the run-only `kind-only-dummy` value and the
@@ -162,11 +204,28 @@ client-supplied `x-api-key` cannot replace it either. Duplicate `Authorization`
 header ordering is outside this claim. The expected provider credential is kept
 out of logs and evidence.
 
-Run the static fixture regression check with:
+Run the declarative fixture regression check with:
 
 ```console
 ./test/kind-env/test-provider-credentials.sh
 ```
+
+To validate the retained cluster as well, pass its explicit Kind context:
+
+```console
+./test/kind-env/test-provider-credentials.sh \
+  --context kind-external-model-two-plane
+```
+
+The live check verifies that every active Katan Deployment still contains
+`--validate-keys` and its expected `--api-keys openai=...` mapping, then probes
+Provider A, Provider B, and the separate IPP transition Service. For each it
+requires HTTP 401 for no credential and a wrong Bearer credential, HTTP 200 for
+the matching fixture credential, and HTTP 200 when a wrong `x-api-key` is
+added alongside the matching Bearer credential. It prints status codes only;
+fixture credentials and response bodies are not written to evidence. The
+Gateway qualification remains authoritative for proving that the MaaS caller
+credential is replaced by the projected provider credential.
 
 Credential rotation is implemented in Praxis AI's existing `credential_inject`
 filter: projected Secret files are revalidated by an event-driven watcher and
@@ -206,6 +265,23 @@ Required source checkouts are supplied through environment variables:
 * `KUADRANT_OPERATOR_REPO`
 * `PRAXIS_EXTPROC_REPO`
 
+Source selection and provenance are explicit. `PRAXIS_REPO` and
+`PRAXIS_EXTPROC_REPO` point at the checked-out integration sources; the
+expected revisions are recorded before each build. `MAAS_CONTROLLER_REPO`
+must point at the merged `main` branch for new runs (the harness verifies that
+the checkout is clean but does not enforce the branch name). `KUADRANT_OPERATOR_REPO`
+is the pinned dependency checkout used for platform fixtures. `LLM_KATAN_REPO`
+is optional in the normal workflow because the default provider image is the
+public digest-pinned artifact; a source checkout is used only for explicit
+development builds.
+
+Each run records repository path, remote, branch or detached state, HEAD,
+tracked diff hash, and untracked-content hash before building. After
+publication, the image reference is resolved to a registry digest and the
+deployed digest is recorded separately. The digest is the executable artifact;
+the source revision is provenance. A dirty dependency or unexpected source
+state is not silently changed by the harness.
+
 No kubeconfig context is read implicitly. Provisioning uses only
 `kind-${LOCAL_ENV_CLUSTER}`. Images are built from these checkouts when absent
 and loaded into Kind with `imagePullPolicy: Never`.
@@ -219,3 +295,198 @@ deterministic provider-compatible responses for routing, hot-swap, and
 last-known-good assertions. It is not deployed as part of the production
 architecture. It may eventually be replaced by a smaller purpose-built mock
 that satisfies the same E2E contract.
+## Optional real OpenAI qualification
+
+This is an opt-in, single-provider diagnostic for a run-owned Kind cluster. It
+is separate from the fixture-backed qualification and makes one minimal,
+paid request through the public MaaS Gateway. Do not run it in automated
+qualification or with a production credential.
+
+The provider credential and the MaaS client key are different credentials. The
+OpenAI key belongs only in a tenant-local Secret created from a protected local
+file; the MaaS client key is minted through `POST /v1/api-keys` and is revoked
+after the request. Disable shell tracing before handling either credential, do
+not put a key value in an argument or evidence, and never add either value to
+a ConfigMap or overlay.
+
+The temporary control-plane objects must use these identities:
+
+* `ExternalProvider` may have an operational name such as `openai` and points
+  to `api.openai.com` with `provider: openai`, `auth.type: apikey`, and the
+  tenant-local Secret reference.
+* `ExternalModel.metadata.name` is an infrastructure name such as
+  `openai-gpt-4o-mini`, while `spec.modelName` is the client-visible
+  `gpt-4o-mini` and `targetModel` is also `gpt-4o-mini`.
+* `MaaSModelRef.metadata.name` must be exactly `gpt-4o-mini`; its
+  `spec.modelRef.name` points to the ExternalModel name. The temporary
+  subscription must reference that MaaSModelRef. MaaS authorization matches
+  the client-visible model identity, not the ExternalModel resource name.
+
+Create the provider Secret without printing its contents:
+
+```console
+export OPENAI_KEY_FILE=/path/to/protected/openai-key
+export OPENAI_RUN_ID=external-model-openai-$(date -u +%Y%m%dT%H%M%SZ)
+export OPENAI_EVIDENCE="$PWD/evidence/$OPENAI_RUN_ID"
+export OPENAI_CLUSTER="external-model-openai-${OPENAI_RUN_ID##*-}"
+export KUBECTX="kind-$OPENAI_CLUSTER"
+
+# Start from the ordinary fixture stack. The OpenAI resources are not part of
+# base provisioning and are never selected by a manifest glob.
+LOCAL_ENV_CLUSTER="$OPENAI_CLUSTER" \
+LOCAL_ENV_EVIDENCE_ROOT="$OPENAI_EVIDENCE" \
+PRAXIS_EXTRA_KNOWN_CLUSTERS=provider-openai \
+APPLY_REAL_OPENAI_FIXTURE=false \
+  ./run.sh --provision
+
+set +x
+kubectl --context "$KUBECTX" -n models-as-a-service create secret generic openai-provider-credentials \
+  --from-file=api-key="$OPENAI_KEY_FILE"
+```
+
+Apply the shared CR chain and the Kind-only policy explicitly. Do not patch an
+overlay or generated AuthPolicy:
+
+```console
+set +x
+EXTERNAL_MODEL_NAMESPACE=models-as-a-service \
+EXTERNAL_MODEL_RUN_ID="$OPENAI_RUN_ID" \
+EXTERNAL_MODEL_OPENAI_SECRET=openai-provider-credentials \
+EXTERNAL_MODEL_OPENAI_SUBSCRIPTION=openai-e2e-subscription \
+EXTERNAL_MODEL_OPENAI_POLICY=openai-e2e-access \
+EXTERNAL_MODEL_OPENAI_USER=kind-user \
+  envsubst '${EXTERNAL_MODEL_NAMESPACE} ${EXTERNAL_MODEL_RUN_ID} ${EXTERNAL_MODEL_OPENAI_SECRET} ${EXTERNAL_MODEL_OPENAI_SUBSCRIPTION} ${EXTERNAL_MODEL_OPENAI_POLICY} ${EXTERNAL_MODEL_OPENAI_USER}' \
+    <test/external-model/openai.yaml.tmpl | kubectl --context "$KUBECTX" apply -f -
+kubectl --context "$KUBECTX" apply -f test/kind-env/manifests/45-real-openai-policies.yaml
+set +x
+```
+
+Create a run-owned in-cluster curl client. Kind uses the HTTP Gateway listener;
+TLS remains mandatory on the Praxis-to-OpenAI connection. The client has no
+ServiceAccount token and no embedded credentials:
+
+```console
+docker pull curlimages/curl:8.10.1
+kind load docker-image curlimages/curl:8.10.1 --name "$OPENAI_CLUSTER"
+export MAAS_CA="$(cat "$OPENAI_EVIDENCE/.active-run")/maas-api-ca.crt"
+kubectl --context "$KUBECTX" -n models-as-a-service create configmap openai-client-ca \
+  --from-file=ca.crt="$MAAS_CA" --dry-run=client -o yaml | \
+  kubectl --context "$KUBECTX" apply -f -
+EXTERNAL_MODEL_CLIENT_NAME=openai-client \
+EXTERNAL_MODEL_CLIENT_NAMESPACE=models-as-a-service \
+EXTERNAL_MODEL_CLIENT_IMAGE=curlimages/curl:8.10.1 \
+EXTERNAL_MODEL_RUN_ID="$OPENAI_RUN_ID" \
+EXTERNAL_MODEL_CLIENT_VOLUMES='[{"name":"maas-ca","configMap":{"name":"openai-client-ca"}}]' \
+EXTERNAL_MODEL_CLIENT_VOLUME_MOUNTS='[{"name":"maas-ca","mountPath":"/etc/maas-ca","readOnly":true}]' \
+  envsubst '${EXTERNAL_MODEL_CLIENT_NAME} ${EXTERNAL_MODEL_CLIENT_NAMESPACE} ${EXTERNAL_MODEL_CLIENT_IMAGE} ${EXTERNAL_MODEL_RUN_ID} ${EXTERNAL_MODEL_CLIENT_VOLUMES} ${EXTERNAL_MODEL_CLIENT_VOLUME_MOUNTS}' \
+    >"$OPENAI_EVIDENCE/client-base.yaml"
+yq eval-all 'select(fileIndex == 0) * select(fileIndex == 1)' \
+  "$OPENAI_EVIDENCE/client-base.yaml" test/kind-env/manifests/60-client-kind-patch.yaml \
+  | kubectl --context "$KUBECTX" apply -f -
+kubectl --context "$KUBECTX" -n models-as-a-service wait --for=condition=Ready pod/openai-client --timeout=120s
+```
+
+Before sending traffic, wait for `ExternalProvider`, `ExternalModel`,
+`MaaSModelRef`, subscription, `HTTPRoute`, and Praxis readiness. Inspect the
+controller-generated overlay and require exactly one OpenAI cluster with
+`api.openai.com:443`, `http.authority: api.openai.com`, TLS enabled,
+`tls.sni: api.openai.com`, certificate verification enabled, and no random
+selection policy. The overlay contains only the Secret reference. Plaintext is
+permitted only for the explicit Katan fixture cluster names passed through the
+controller's `--praxis-plaintext-cluster` option; public provider endpoints
+otherwise use verified TLS.
+
+Start a short-lived verified port-forward only for MaaS key administration;
+the OpenAI request itself is sent from the in-cluster client and never uses a
+port-forward. Keep the response in a shell variable while tracing is disabled,
+and never print it:
+
+```console
+set +x
+kubectl --context "$KUBECTX" -n maas-system port-forward svc/maas-api 18443:8443 >"$OPENAI_EVIDENCE/maas-api-admin-port-forward.log" 2>&1 &
+MAAS_PF=$!
+for _ in $(seq 1 20); do rg -q 'Forwarding from' "$OPENAI_EVIDENCE/maas-api-admin-port-forward.log" && break; sleep 1; done
+MAAS_KEY_RESPONSE=$(curl --cacert "$MAAS_CA" --resolve "maas-api.maas-system.svc.cluster.local:18443:127.0.0.1" \
+  -sS -H 'content-type: application/json' \
+  -H 'X-MaaS-Username: kind-user' -H 'X-MaaS-Group: ["system:authenticated"]' \
+  --data '{"name":"openai-kind-e2e","ephemeral":true,"subscription":"openai-e2e-subscription"}' \
+  https://maas-api.maas-system.svc.cluster.local:18443/v1/api-keys)
+MAAS_KEY=$(jq -er '.key' <<<"$MAAS_KEY_RESPONSE")
+MAAS_KEY_ID=$(jq -er '.id' <<<"$MAAS_KEY_RESPONSE")
+unset MAAS_KEY_RESPONSE
+kill "$MAAS_PF" 2>/dev/null || true
+wait "$MAAS_PF" 2>/dev/null || true
+```
+
+Send exactly one request from the client Pod. This is the only paid request;
+do not retry a received HTTP response:
+
+```console
+BODY='{"model":"gpt-4o-mini","messages":[{"role":"user","content":"Hello"}]}'
+printf '%s\n%s\n' "$MAAS_KEY" "$BODY" | \
+  kubectl --context "$KUBECTX" -n models-as-a-service exec -i openai-client -- \
+    sh -c 'read -r key && read -r body && curl --silent --show-error --max-time 60 \
+      -D /tmp/headers -o /tmp/body -w "%{http_code}" \
+      -H "Authorization: Bearer $key" -H "Content-Type: application/json" \
+      --data-binary "$body" \
+      "http://maas-default-gateway.maas-system.svc.cluster.local/models-as-a-service/gpt-4o-mini/v1/chat/completions"'
+```
+
+Capture only the HTTP status, response model/ID, and allowlisted OpenAI
+response headers. Never retain Authorization, API-key, cookie, Secret, or
+private-key values. If the provider returns an error, retain only
+`error.message`, `error.type`, `error.code`, and `error.param` in sanitized
+evidence, then delete the raw response.
+
+Revoke the temporary MaaS key and remove the run-owned resources in dependency
+order. The API key is passed through the Pod stdin and is not a command
+argument:
+
+```console
+set +x
+kubectl --context "$KUBECTX" -n maas-system port-forward svc/maas-api 18443:8443 >"$OPENAI_EVIDENCE/maas-api-admin-port-forward.log" 2>&1 &
+MAAS_PF=$!
+for _ in $(seq 1 20); do rg -q 'Forwarding from' "$OPENAI_EVIDENCE/maas-api-admin-port-forward.log" && break; sleep 1; done
+curl --cacert "$MAAS_CA" --resolve "maas-api.maas-system.svc.cluster.local:18443:127.0.0.1" \
+  --silent --show-error --output /dev/null --write-out '%{http_code}' \
+  -X DELETE "https://maas-api.maas-system.svc.cluster.local:18443/v1/api-keys/$MAAS_KEY_ID" \
+  -H "Authorization: Bearer $MAAS_KEY"
+kill "$MAAS_PF" 2>/dev/null || true
+wait "$MAAS_PF" 2>/dev/null || true
+kubectl --context "$KUBECTX" -n models-as-a-service delete externalmodel openai-gpt-4o-mini --ignore-not-found
+kubectl --context "$KUBECTX" -n models-as-a-service delete externalprovider openai --ignore-not-found
+kubectl --context "$KUBECTX" -n models-as-a-service delete maasmodelref gpt-4o-mini maassubscription openai-e2e-subscription maasauthpolicy openai-e2e-access --ignore-not-found
+kubectl --context "$KUBECTX" -n models-as-a-service delete secret openai-provider-credentials --ignore-not-found
+kubectl --context "$KUBECTX" -n models-as-a-service delete configmap openai-client-ca --ignore-not-found
+kubectl --context "$KUBECTX" -n models-as-a-service delete pod openai-client --ignore-not-found
+unset MAAS_KEY MAAS_KEY_ID MAAS_ADMIN_TOKEN
+```
+
+Restore Provider A and prove one fixture request returns HTTP 200 before
+retaining or destroying the cluster. Scan the evidence and worktree for
+credential-shaped values. The normal fixture qualification must be run before
+the opt-in request; its cleanup must restore Provider A rather than deleting
+the baseline model or subscription.
+
+Send one request through the Gateway, without retries or optional fields:
+
+```json
+{"model":"gpt-4o-mini","messages":[{"role":"user","content":"Hello"}]}
+```
+
+Capture only status and an allowlist of non-secret response headers. If the
+provider returns an error, copy only `error.message`, `error.type`,
+`error.code`, and `error.param` into a sanitized artifact, then immediately
+truncate the restricted temporary response file. On success, retain only the
+response model, response ID, and a short summary. Never save Authorization,
+API-key, cookie, Secret, or private-key values.
+
+Cleanup is ownership-ordered: revoke temporary MaaS keys, remove the
+ExternalModel and ExternalProvider, wait for their routes and transports to
+disappear, remove the MaaSModelRef/subscription/policy additions, then remove
+the provider Secret. Restore the normal Provider A fixture and verify one
+fixture request returns HTTP 200 before retaining or destroying the cluster.
+Scan the evidence and worktree for credential-shaped values. This workflow
+proves one real provider request; it does not prove multi-provider
+authorization dispatch, credential rotation, OAuth2, SigV4, or IPP
+transition/rollback.

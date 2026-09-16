@@ -124,7 +124,16 @@ MAAS_CONTROLLER_IMAGE="$PULL_REGISTRY/$IMAGE_PROJECT/maas-controller:$OPENSHIFT_
 
 TOKEN=$("${OC[@]}" whoami -t)
 AUTHFILE=$(mktemp "$STATE/.registry-auth.XXXXXX")
-trap 'rm -f "$AUTHFILE"' EXIT
+CLIENT_CA_FILE=""
+PROVIDER_CA_BUNDLE=""
+PROVIDER_CA_SERVICE=""
+cleanup_temp_files() {
+  local file
+  for file in "$AUTHFILE" "$CLIENT_CA_FILE" "$PROVIDER_CA_BUNDLE" "$PROVIDER_CA_SERVICE"; do
+    [[ -z "$file" ]] || rm -f -- "$file"
+  done
+}
+trap cleanup_temp_files EXIT
 rm -f "$AUTHFILE"
 REGISTRY_CERT_DIR=$(mktemp -d "$STATE/.registry-ca.XXXXXX")
 "${OC[@]}" get secret router-ca -n openshift-ingress-operator -o jsonpath='{.data.tls\.crt}' | base64 -d >"$REGISTRY_CERT_DIR/ca.crt"
@@ -217,6 +226,9 @@ resources:
 - ../deployment/base/maas-controller/default
 configMapGenerator:
 - name: maas-parameters
+  # Canonical MaaS main already generates this ConfigMap. Merge the immutable
+  # run image inputs into that source-owned object instead of creating a
+  # duplicate generator with the same resource identity.
   behavior: merge
   literals:
   - maas-api-image=$MAAS_API_IMAGE
@@ -233,34 +245,6 @@ patches:
       path: /spec/template/spec/containers/0/imagePullPolicy
       value: IfNotPresent
 - target:
-    kind: Deployment
-    name: maas-controller
-  patch: |-
-    - op: replace
-      path: /spec/template/spec/containers/0/env/1/value
-      value: $OPENSHIFT_E2E_GATEWAY_NAME
-- target:
-    kind: Deployment
-    name: maas-controller
-  patch: |-
-    - op: replace
-      path: /spec/template/spec/containers/0/env/2/value
-      value: $OPENSHIFT_E2E_GATEWAY_NAMESPACE
-- target:
-    kind: Deployment
-    name: maas-controller
-  patch: |-
-    - op: replace
-      path: /spec/template/spec/containers/0/env/1/value
-      value: $OPENSHIFT_E2E_GATEWAY_NAME
-- target:
-    kind: Deployment
-    name: maas-controller
-  patch: |-
-    - op: replace
-      path: /spec/template/spec/containers/0/env/2/value
-      value: $OPENSHIFT_E2E_GATEWAY_NAMESPACE
-- target:
     kind: NetworkPolicy
     name: maas-controller-allow-monitoring
   patch: |-
@@ -275,19 +259,41 @@ patches:
 EOF
 MAAS_RENDERED="$STATE/.maas-rendered.$$"
 kustomize build "$MAAS_OVERLAY" >"$MAAS_RENDERED"
+# A prior run may have set this related-image variable to a literal value
+# with `oc set env`, while canonical MaaS declares it as a ConfigMap-backed
+# valueFrom. Remove only that generated override before applying the valid
+# source manifest so Kubernetes does not merge incompatible EnvVar shapes.
+if "${OC[@]}" get deployment maas-controller -n maas-system >/dev/null 2>&1; then
+  "${OC[@]}" set env deployment/maas-controller -n maas-system \
+    RELATED_IMAGE_ODH_MAAS_API_IMAGE- >"$OUT/normalize-maas-related-image-env.log" 2>&1
+fi
 "${OC[@]}" apply -f "$MAAS_RENDERED" >"$OUT/deploy-maas.log" 2>&1
 attach_pull_secret_to_sa maas-system maas-controller
+"${OC[@]}" set env deployment/maas-controller -n maas-system \
+  GATEWAY_NAME="$OPENSHIFT_E2E_GATEWAY_NAME" \
+  GATEWAY_NAMESPACE="$OPENSHIFT_E2E_GATEWAY_NAMESPACE" >>"$OUT/deploy-maas.log" 2>&1
+"${OC[@]}" get deployment maas-controller -n maas-system -o json >"$OUT/maas-controller-after-gateway-env.json"
+jq -e --arg gateway "$OPENSHIFT_E2E_GATEWAY_NAME" --arg namespace "$OPENSHIFT_E2E_GATEWAY_NAMESPACE" '
+  (.spec.template.spec.containers[0].env // []) as $env |
+  ([ $env[] | select(.name == "GATEWAY_NAME") ] | length == 1 and .[0].value == $gateway and (.[0].valueFrom // null) == null) and
+  ([ $env[] | select(.name == "GATEWAY_NAMESPACE") ] | length == 1 and .[0].value == $namespace and (.[0].valueFrom // null) == null)
+' "$OUT/maas-controller-after-gateway-env.json" >/dev/null
 "${OC[@]}" rollout restart deployment/maas-controller -n maas-system >>"$OUT/deploy-maas.log" 2>&1
 KUBECONFIG="${OPENSHIFT_KUBECONFIG:-$STATE/kubeconfig}" NAMESPACE=maas-system INFRA_NAMESPACE=maas-system "$MAAS_CONTROLLER_REPO/scripts/setup-database.sh" >>"$OUT/deploy-maas.log" 2>&1
 rm -rf "$MAAS_OVERLAY" "$MAAS_RENDERED"
 {
   "${OC[@]}" set image deployment/maas-controller manager="$MAAS_CONTROLLER_IMAGE" -n maas-system
+  # The MaaS Tenant reconciler owns maas-api.  Use its documented related-image
+  # override so reconciliation itself renders the source-matched immutable
+  # image instead of restoring the upstream floating default.
+  "${OC[@]}" set env deployment/maas-controller RELATED_IMAGE_ODH_MAAS_API_IMAGE="$MAAS_API_IMAGE" -n maas-system
   "${OC[@]}" patch deployment maas-controller -n maas-system --type=json -p='[{"op":"replace","path":"/spec/template/spec/containers/0/imagePullPolicy","value":"IfNotPresent"}]'
 } >>"$OUT/deploy-maas.log" 2>&1
 "${OC[@]}" rollout status deployment/maas-controller -n maas-system --timeout=300s >>"$OUT/deploy-maas.log" 2>&1
 
 # Admission must be serving before the first AITenant is submitted. This gate
 # checks the complete webhook contract, not merely Deployment existence.
+if "${OC[@]}" get validatingwebhookconfiguration maas-validating-webhook-configuration -o json >/dev/null 2>&1; then
 WEBHOOK_DEADLINE=$(( $(date +%s) + 180 ))
 while :; do
   DEPLOYMENT_READY=$("${OC[@]}" get deployment maas-controller -n maas-system -o json 2>/dev/null | jq -r '.status.availableReplicas == 1 and .status.readyReplicas == 1' || true)
@@ -308,6 +314,7 @@ if ! openssl verify -CAfile <("${OC[@]}" get configmap openshift-service-ca.crt 
   exit 1
 fi
 rm -f "$WEBHOOK_CERT"
+fi
 if ! "${OC[@]}" apply --dry-run=server -f - >"$OUT/aitenant-admission-dry-run.txt" 2>&1 <<EOF
 apiVersion: maas.opendatahub.io/v1alpha1
 kind: AITenant
@@ -330,11 +337,11 @@ fi
 # MaaS owns AITenant bootstrap and reports the resolved namespace/status. This
 # object is the only run-owned object placed in the platform AITenant namespace.
 if [[ "$AITENANT_NAME" == models-as-a-service && ! -s "$STATE/aitenant-original.json" ]]; then
-  # The default tenant is shared MaaS state: retain its metadata before the
+  # The shared MaaS AITenant is shared state: retain its metadata before the
   # run applies Praxis opt-in so cleanup can restore, never delete, it.
-  if "${OC[@]}" get aitenant "$AITENANT_NAME" -n ai-tenants -o json >"$OUT/default-tenant-existing.json" 2>/dev/null; then
+  if "${OC[@]}" get aitenant "$AITENANT_NAME" -n ai-tenants -o json >"$OUT/shared-aitenant-existing.json" 2>/dev/null; then
     jq '{metadata:{labels:(.metadata.labels // {}),annotations:(.metadata.annotations // {})},spec:.spec}' \
-      "$OUT/default-tenant-existing.json" >"$STATE/aitenant-original.json"
+      "$OUT/shared-aitenant-existing.json" >"$STATE/aitenant-original.json"
   else
     jq -n '{metadata:{labels:{},annotations:{}},spec:{}}' >"$STATE/aitenant-original.json"
   fi
@@ -404,9 +411,9 @@ run_env_tmp="$STATE/run.env.tmp.$$"
 sed "s#^OPENSHIFT_E2E_TENANT_NAMESPACE=.*#OPENSHIFT_E2E_TENANT_NAMESPACE=$OPENSHIFT_E2E_TENANT_NAMESPACE#" "$STATE/run.env" >"$run_env_tmp"
 mv "$run_env_tmp" "$STATE/run.env"
 
-# The source-matched default tenant provides the canonical shared callback
+# The source-matched shared MaaS AITenant provides the canonical callback
 # Service natively. Use it directly after proving its selector, endpoint, and
-# service-ca certificate. The compatibility proxy is only for a non-default
+# service-ca certificate. The compatibility proxy is only for a non-primary
 # tenant-qualified API and is never a production manifest.
 if [[ "$AITENANT_NAME" == models-as-a-service ]]; then
   "${OC[@]}" get service maas-api -n maas-system -o json >"$OUT/native-callback-service.json"
@@ -479,11 +486,32 @@ printf 'authorino_pod=%s\ninjected_sha256=%s\nmounted_sha256=%s\n' "$AUTHORINO_P
 MAAS_CA_ENDPOINT_IP=$("${OC[@]}" get endpointslice -n maas-system -l kubernetes.io/service-name=maas-api -o jsonpath='{.items[0].endpoints[?(@.conditions.ready==true)].addresses[0]}' 2>/dev/null || true)
 [[ -n "$MAAS_CA_ENDPOINT_IP" ]] || { echo "MaaS API has no ready endpoint for service-ca verification" >&2; exit 1; }
 MAAS_CA_HOST=maas-api.maas-system.svc.cluster.local
-"${OC[@]}" exec -n kuadrant-system "$AUTHORINO_POD" -- sh -c "curl --silent --show-error --fail --cacert /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem --resolve $MAAS_CA_HOST:8443:$MAAS_CA_ENDPOINT_IP --write-out 'status=%{http_code} ssl_verify_result=%{ssl_verify_result}\\n' --output /dev/null https://$MAAS_CA_HOST:8443/health" >"$OUT/authorino-to-maas-tls.txt" 2>&1 || {
-  echo "Authorino-to-MaaS TLS verification failed; diagnostics: $OUT/authorino-to-maas-tls.txt" >&2
-  exit 1
-}
-grep -q 'ssl_verify_result=0' "$OUT/authorino-to-maas-tls.txt" || { echo "Authorino-to-MaaS TLS did not verify; diagnostics: $OUT/authorino-to-maas-tls.txt" >&2; exit 1; }
+TLS_PROBE="$OUT/authorino-to-maas-tls.txt"
+: >"$TLS_PROBE"
+TLS_DEADLINE=$(( $(date +%s) + 120 ))
+while :; do
+  TLS_ATTEMPT=$(mktemp "$STATE/.authorino-to-maas-tls.XXXXXX")
+  set +e
+  timeout 20s "${OC[@]}" exec -n kuadrant-system "$AUTHORINO_POD" -- sh -c "curl --silent --show-error --cacert /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem --resolve $MAAS_CA_HOST:8443:$MAAS_CA_ENDPOINT_IP --write-out 'status=%{http_code} ssl_verify_result=%{ssl_verify_result}\\n' --output /dev/null --max-time 10 https://$MAAS_CA_HOST:8443/health" >"$TLS_ATTEMPT" 2>&1
+  TLS_RC=$?
+  set -e
+  cat "$TLS_ATTEMPT" >>"$TLS_PROBE"
+  if [[ "$TLS_RC" -eq 0 ]]; then
+    grep -q 'status=200 ssl_verify_result=0' "$TLS_ATTEMPT" || {
+      rm -f "$TLS_ATTEMPT"
+      echo "Authorino-to-MaaS TLS probe returned an unexpected HTTP response; diagnostics: $TLS_PROBE" >&2
+      exit 1
+    }
+    rm -f "$TLS_ATTEMPT"
+    break
+  fi
+  rm -f "$TLS_ATTEMPT"
+  if (( $(date +%s) >= TLS_DEADLINE )); then
+    echo "Authorino-to-MaaS TLS verification failed after transport convergence wait; diagnostics: $TLS_PROBE" >&2
+    exit 1
+  fi
+  sleep 2
+done
 
 ROLE_NAME="xmp-controller-role-$OPENSHIFT_E2E_RUN_ID"
 sed "0,/name: ai-gateway-controller-role/s//name: $ROLE_NAME/" "$ROOT/config/self/rbac/clusterrole.yaml" | sed "/^  name: $ROLE_NAME$/a\\  labels:\n    external-model-praxis.opendatahub.io/run-id: $OPENSHIFT_E2E_RUN_ID\n    app.kubernetes.io/managed-by: external-model-praxis-openshift-e2e" | "${OC[@]}" apply -f -
@@ -494,6 +522,17 @@ attach_pull_secret_to_sa "$OPENSHIFT_E2E_CONTROLLER_NAMESPACE" ai-gateway-contro
 export KATAN_IMAGE
 "$ROOT/test/openshift-env/render-manifests.sh" "$RENDER_DIR" 30-provider-fixtures.yaml.tmpl >"$OUT/render-manifests-providers.log"
 apply_rendered 30-provider-fixtures.yaml
+# The provider Services request service-ca serving certificates.  Do not allow
+# qualification to race the certificate injector or start Katan without TLS.
+for provider in a b; do
+  cert_deadline=$((SECONDS + 180))
+  while ! "${OC[@]}" get secret "provider-$provider-tls" -n "$OPENSHIFT_E2E_BACKEND_NAMESPACE" >/dev/null 2>&1; do
+    (( SECONDS < cert_deadline )) || { echo "service-ca certificate for provider-$provider did not appear" >&2; exit 1; }
+    sleep 2
+  done
+  cert_keys=$("${OC[@]}" get secret "provider-$provider-tls" -n "$OPENSHIFT_E2E_BACKEND_NAMESPACE" -o json | jq -r '.data | keys | sort | join(",")')
+  [[ "$cert_keys" == "tls.crt,tls.key" ]] || { echo "provider-$provider service-ca Secret is incomplete" >&2; exit 1; }
+done
 "${OC[@]}" apply -f - <<EOF
 apiVersion: v1
 kind: Secret
@@ -509,11 +548,37 @@ stringData:
   api-key: llm-katan-openai-key
 EOF
 export OPENSHIFT_E2E_TENANT_NAMESPACE OPENSHIFT_E2E_BACKEND_NAMESPACE
+export EXTERNAL_MODEL_NAMESPACE="$OPENSHIFT_E2E_TENANT_NAMESPACE"
+export EXTERNAL_MODEL_RUN_ID="$OPENSHIFT_E2E_RUN_ID"
+export EXTERNAL_MODEL_PROVIDER_A_ENDPOINT="provider-a.${OPENSHIFT_E2E_BACKEND_NAMESPACE}.svc.cluster.local"
+export EXTERNAL_MODEL_PROVIDER_B_ENDPOINT="provider-b.${OPENSHIFT_E2E_BACKEND_NAMESPACE}.svc.cluster.local"
+"$ROOT/test/openshift-env/render-manifests.sh" "$RENDER_DIR" providers.yaml.tmpl >"$OUT/render-manifests-shared-providers.log"
+apply_rendered providers.yaml
 "$ROOT/test/openshift-env/render-manifests.sh" "$RENDER_DIR" 40-model-fixtures.yaml.tmpl >"$OUT/render-manifests-models.log"
 apply_rendered 40-model-fixtures.yaml
 export OPENSHIFT_E2E_USER
 "$ROOT/test/openshift-env/render-manifests.sh" "$RENDER_DIR" 50-maas-fixtures.yaml.tmpl >"$OUT/render-manifests-maas.log"
 apply_rendered 50-maas-fixtures.yaml
+
+# MaaS creates the gateway AuthPolicy from its fixture.  Do not finish
+# provisioning until Kuadrant has both accepted and enforced that generated
+# policy; otherwise the first unauthenticated request can be routed without
+# authentication while the control plane is still converging.
+AUTH_POLICY_EVIDENCE="$OUT/maas-gateway-auth-ready.json"
+AUTH_POLICY_DEADLINE=$((SECONDS + 300))
+while :; do
+  AUTH_POLICY_STATUS=$("${OC[@]}" get authpolicy maas-gateway-auth -n "$OPENSHIFT_E2E_GATEWAY_NAMESPACE" -o json 2>/dev/null || true)
+  if [[ -n "$AUTH_POLICY_STATUS" ]] && jq -e '[.status.conditions[]? | select((.type == "Accepted" or .type == "Enforced") and .status == "True")] | length == 2' <<<"$AUTH_POLICY_STATUS" >/dev/null; then
+    printf '%s\n' "$AUTH_POLICY_STATUS" >"$AUTH_POLICY_EVIDENCE"
+    break
+  fi
+  if (( SECONDS >= AUTH_POLICY_DEADLINE )); then
+    printf '%s\n' "${AUTH_POLICY_STATUS:-{}}" >"$AUTH_POLICY_EVIDENCE"
+    echo "generated MaaS AuthPolicy did not become Accepted and Enforced; diagnostics: $AUTH_POLICY_EVIDENCE" >&2
+    exit 1
+  fi
+  sleep 3
+done
 for _ in $(seq 1 60); do
   praxis_sa=$("${OC[@]}" get serviceaccount -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -l app.kubernetes.io/managed-by=ai-gateway-controller -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
   [[ -n "$praxis_sa" ]] && break
@@ -545,6 +610,32 @@ EOF
 # required for an idempotent retry of an ImagePullBackOff, before qualification
 # records workload identity.
 if "${OC[@]}" get deployment -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -l app=praxis -o name 2>/dev/null | grep -q .; then
+  # Katan's service-ca certificate is valid but is not part of Praxis's base
+  # image trust store. Build a combined run-owned bundle rather than replacing
+  # the image's public CA bundle: external providers such as api.openai.com
+  # must continue to use normal public certificate verification. This is
+  # fixture plumbing only; it does not change controller-rendered TLS or
+  # disable certificate verification.
+  PROVIDER_CA_CONFIGMAP="xmp-provider-ca-$OPENSHIFT_E2E_RUN_ID"
+  PROVIDER_CA_BUNDLE=$(mktemp "$STATE/.provider-ca-bundle.XXXXXX")
+  PROVIDER_CA_SERVICE=$(mktemp "$STATE/.provider-service-ca.XXXXXX")
+  praxis_pod=""
+  for _ in $(seq 1 60); do
+    praxis_pod=$("${OC[@]}" get pod -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -l app=praxis -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+    [[ -n "$praxis_pod" ]] && break
+    sleep 2
+  done
+  [[ -n "$praxis_pod" ]] || { echo "Praxis pod was not available to collect the base CA bundle" >&2; exit 1; }
+  "${OC[@]}" exec "$praxis_pod" -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -- \
+    sh -c 'cat /etc/ssl/certs/ca-certificates.crt' >"$PROVIDER_CA_BUNDLE"
+  "${OC[@]}" get configmap openshift-service-ca.crt -n "$OPENSHIFT_E2E_BACKEND_NAMESPACE" \
+    -o jsonpath='{.data.service-ca\.crt}' >"$PROVIDER_CA_SERVICE"
+  cat "$PROVIDER_CA_SERVICE" >>"$PROVIDER_CA_BUNDLE"
+  "${OC[@]}" create configmap "$PROVIDER_CA_CONFIGMAP" -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" \
+    --from-file=ca-bundle.crt="$PROVIDER_CA_BUNDLE" \
+    --dry-run=client -o yaml | "${OC[@]}" apply -f - >"$OUT/provider-ca-configmap.log"
+  PROVIDER_CA_PATCH=$(jq -cn --arg cm "$PROVIDER_CA_CONFIGMAP" '{spec:{template:{spec:{containers:[{name:"praxis",env:[{name:"SSL_CERT_FILE",value:"/etc/praxis/provider-ca/ca-bundle.crt"}],volumeMounts:[{name:"provider-ca",mountPath:"/etc/praxis/provider-ca",readOnly:true}]}],volumes:[{name:"provider-ca",configMap:{name:$cm}}]}}}}')
+  "${OC[@]}" patch deployment praxis -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" --type=strategic -p "$PROVIDER_CA_PATCH" >"$OUT/provider-ca-patch.log"
   "${OC[@]}" rollout restart deployment -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -l app=praxis >"$OUT/praxis-rollout-retry.log"
   "${OC[@]}" rollout status deployment -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -l app=praxis --timeout=300s >>"$OUT/praxis-rollout-retry.log"
 fi
@@ -555,11 +646,18 @@ fi
 # mounted.  Requests and temporary API keys are supplied over stdin by the
 # qualification script, never as pod arguments or evidence.
 CLIENT_CA_CONFIGMAP="xmp-gateway-ca-$OPENSHIFT_E2E_RUN_ID"
-"${OC[@]}" get secret "$OPENSHIFT_E2E_GATEWAY_TLS_SECRET" -n "$OPENSHIFT_E2E_GATEWAY_NAMESPACE" -o jsonpath='{.data.tls\.crt}' | base64 -d | \
-  "${OC[@]}" create configmap "$CLIENT_CA_CONFIGMAP" -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" --from-file=ca.crt=/dev/stdin \
+CLIENT_CA_FILE=$(mktemp)
+"${OC[@]}" get secret "$OPENSHIFT_E2E_GATEWAY_TLS_SECRET" -n "$OPENSHIFT_E2E_GATEWAY_NAMESPACE" -o jsonpath='{.data.tls\.crt}' | base64 -d >"$CLIENT_CA_FILE"
+"${OC[@]}" get configmap openshift-service-ca.crt -n "$OPENSHIFT_E2E_BACKEND_NAMESPACE" -o jsonpath='{.data.service-ca\.crt}' >>"$CLIENT_CA_FILE"
+"${OC[@]}" create configmap "$CLIENT_CA_CONFIGMAP" -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" --from-file=ca.crt="$CLIENT_CA_FILE" \
     --dry-run=client -o yaml | "${OC[@]}" apply -f - >"$OUT/client-ca-configmap.log"
 export CLIENT_CA_CONFIGMAP
-"$ROOT/test/openshift-env/render-manifests.sh" "$RENDER_DIR" 60-client.yaml.tmpl >"$OUT/render-manifests-client.log"
-apply_rendered 60-client.yaml
-"${OC[@]}" wait --for=condition=Ready pod/xmp-client-"$OPENSHIFT_E2E_RUN_ID" -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" --timeout=120s
+export EXTERNAL_MODEL_CLIENT_NAME="xmp-client-$OPENSHIFT_E2E_RUN_ID"
+export EXTERNAL_MODEL_CLIENT_NAMESPACE="$OPENSHIFT_E2E_TENANT_NAMESPACE"
+export EXTERNAL_MODEL_CLIENT_IMAGE='curlimages/curl:8.10.1@sha256:d9b4541e214bcd85196d6e92e2753ac6d0ea699f0af5741f8c6cccbfcf00ef4b'
+export EXTERNAL_MODEL_CLIENT_VOLUME_MOUNTS='[{name: gateway-ca, mountPath: /etc/xmp/ca, readOnly: true}]'
+export EXTERNAL_MODEL_CLIENT_VOLUMES="[{name: gateway-ca, configMap: {name: $CLIENT_CA_CONFIGMAP}}]"
+"$ROOT/test/openshift-env/render-manifests.sh" "$RENDER_DIR" client.yaml.tmpl >"$OUT/render-manifests-client.log"
+apply_rendered client.yaml
+"${OC[@]}" wait --for=condition=Ready pod/"$EXTERNAL_MODEL_CLIENT_NAME" -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" --timeout=120s
 printf '%s\n' "$OUT"

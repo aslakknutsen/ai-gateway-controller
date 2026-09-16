@@ -8,6 +8,8 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 STATE=${OPENSHIFT_E2E_STATE:-"$ROOT/.openshift-state"}
 # shellcheck disable=SC1091
 source "$STATE/run.env"
+# shellcheck disable=SC1091
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/test/external-model/request.sh"
 command -v timeout >/dev/null || { echo "timeout is required" >&2; exit 1; }
 OC=(timeout --foreground 45s oc --kubeconfig "${OPENSHIFT_KUBECONFIG:-$STATE/kubeconfig}")
 OUT="$OPENSHIFT_E2E_EVIDENCE_ROOT/e2e-$(date -u +%Y%m%dT%H%M%SZ)-$$"
@@ -88,6 +90,21 @@ record 6 "HTTPRoute ResolvedRefs" PASS gateway "ResolvedRefs=True observed"
 "${OC[@]}" get deployment,service,serviceaccount,configmap -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -o json >"$OUT/tenant-resources.json"
 wait_json "Praxis deployment" "${OC[*]} get deployment -n $OPENSHIFT_E2E_TENANT_NAMESPACE -l app.kubernetes.io/managed-by=ai-gateway-controller -o json | jq -e '.items | length == 1 and .[0].status.availableReplicas == 1' >/dev/null" || { record 7 "standalone Praxis Ready" FAIL tenant "tenant Praxis deployment did not become available"; exit 1; }
 record 7 "standalone Praxis Ready" PASS tenant "tenant-local deployment available"
+praxis_config=$(${OC[@]} get configmap praxis-config -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -o jsonpath='{.data.config\.yaml}' 2>/dev/null || true)
+printf '%s\n' "$praxis_config" >"$OUT/praxis-transport-config.txt"
+transport_ok=true
+for provider in a b; do
+  endpoint="provider-$provider.$OPENSHIFT_E2E_BACKEND_NAMESPACE.svc.cluster.local"
+  grep -Fq "authority: \"$endpoint\"" "$OUT/praxis-transport-config.txt" || transport_ok=false
+  grep -Fq "sni: \"$endpoint\"" "$OUT/praxis-transport-config.txt" || transport_ok=false
+  grep -Fq "endpoints: [\"$endpoint:443\"]" "$OUT/praxis-transport-config.txt" || transport_ok=false
+done
+if [[ "$transport_ok" == true ]] && ! grep -Eq 'sni: "[^"]+:[0-9]+' "$OUT/praxis-transport-config.txt"; then
+  record 8-transport "External HTTPS transport" PASS transport "Provider A/B authority, verified TLS SNI hostnames, and explicit :443 dial ports observed"
+else
+  record 8-transport "External HTTPS transport" FAIL transport "Praxis config did not prove authority, verified TLS SNI, and explicit :443 dial ports for both providers"
+  exit 1
+fi
 PRAXIS_SA=$("${OC[@]}" get deployment -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -l app.kubernetes.io/managed-by=ai-gateway-controller -o jsonpath='{.items[0].spec.template.spec.serviceAccountName}' 2>/dev/null || true)
 if [[ -z "$PRAXIS_SA" ]]; then
   record 8 "Praxis Secret API denied" FAIL rbac "standalone Praxis ServiceAccount was not found"
@@ -105,6 +122,9 @@ fi
 jq '.functional="RUNNING" | .note="functional request qualification"' "$RESULTS" >"$tmp"
 mv "$tmp" "$RESULTS"
 CLIENT="xmp-client-$OPENSHIFT_E2E_RUN_ID"
+external_model_client_exec() {
+  "${OC[@]}" exec -i "$CLIENT" -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -- "$@"
+}
 # The command array is intentionally expanded in several remote-command
 # contexts below; keep these reviewed expansions visible to ShellCheck.
 # shellcheck disable=SC2068,SC2016
@@ -116,7 +136,10 @@ request() {
     printf '%s' "$body" | ${OC[@]} exec -i "$CLIENT" -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -- sh -c 'curl --silent --show-error --output /tmp/xmp-request --write-out "%{http_code}" --max-time 30 --cacert /etc/xmp/ca/ca.crt -X POST "$1" -H "Content-Type: application/json" --data-binary @-' sh "$url"
     return
   fi
-  printf '%s\n%s' "$key" "$body" | ${OC[@]} exec -i "$CLIENT" -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -- sh -c 'read -r key; curl --silent --show-error --output /tmp/xmp-request --write-out "%{http_code}" --max-time 30 --cacert /etc/xmp/ca/ca.crt -X POST "$1" -H "Authorization: Bearer $key" -H "Content-Type: application/json" --data-binary @-' sh "$url"
+  EXTERNAL_MODEL_CLIENT_EXEC=external_model_client_exec
+  EXTERNAL_MODEL_CLIENT_OUTPUT=/tmp/xmp-request
+  export EXTERNAL_MODEL_CLIENT_EXEC EXTERNAL_MODEL_CLIENT_OUTPUT
+  printf '%s\n%s\n' "$key" "$body" | external_model_client_post "$url" /etc/xmp/ca/ca.crt
 }
 request_with_x_api_key_override() {
   local key=$1 url=$2 body=$3
@@ -142,7 +165,7 @@ wait_for_gateway_tls() {
 }
 wait_for_praxis_overlay() {
   local expected_provider=$1 expected_generation=$2 expected_digest=$3
-  local stable=0 previous="" observation config_content mounted_content static_config generation digest recomputed mounted_digest
+  local stable=0 previous="" observation config_content mounted_content static_config generation digest recomputed mounted_digest praxis_identity
   local deadline=$((SECONDS + 180))
   while (( SECONDS < deadline )); do
     observation=""
@@ -151,6 +174,7 @@ wait_for_praxis_overlay() {
     generation=$(${OC[@]} get configmap routing-overlay -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -o jsonpath='{.metadata.annotations.inference\.opendatahub\.io/routing-overlay-source-generation}' 2>/dev/null || true)
     digest=$(${OC[@]} get configmap routing-overlay -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -o jsonpath='{.metadata.annotations.inference\.opendatahub\.io/routing-overlay-content-digest}' 2>/dev/null || true)
     mounted_content=$(${OC[@]} exec deploy/praxis -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -- cat /etc/praxis/routing/routing-overlay.json 2>/dev/null || true)
+    praxis_identity=$(${OC[@]} get pods -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -l app=praxis -o json 2>/dev/null | jq -r '[.items[] | select([.status.conditions[]? | select(.type == "Ready" and .status == "True")] | length == 1)] | if length == 1 then .[0] | [.metadata.uid,([.status.containerStatuses[]?.restartCount]|add // 0)] | @tsv else empty end' || true)
     printf '%s' "$config_content" >"$OUT/config-overlay.json"
     printf '%s' "$mounted_content" >"$OUT/mounted-overlay.json"
     recomputed=$($RECOMPUTE_BIN "$OUT/config-overlay.json" 2>/dev/null || true)
@@ -162,8 +186,8 @@ wait_for_praxis_overlay() {
       expected_generation="$generation"
       expected_digest="$digest"
     fi
-    if [[ "$generation" == "$expected_generation" && "$digest" == "$expected_digest" && "$digest" =~ ^[0-9a-f]{64}$ && "$recomputed" == "$digest" && "$mounted_digest" == "$digest" && "$config_content" == *"provider-provider-$expected_provider"* && "$mounted_content" == *"provider-provider-$expected_provider"* && "$static_config" == *"provider-provider-a"* && "$static_config" == *"provider-provider-b"* ]]; then
-      observation="$generation:$digest:$mounted_digest:$expected_provider"
+    if [[ -n "$praxis_identity" && "$generation" == "$expected_generation" && "$digest" == "$expected_digest" && "$digest" =~ ^[0-9a-f]{64}$ && "$recomputed" == "$digest" && "$mounted_digest" == "$digest" && "$config_content" == *"provider-provider-$expected_provider"* && "$mounted_content" == *"provider-provider-$expected_provider"* && "$static_config" == *"provider-provider-a"* && "$static_config" == *"provider-provider-b"* ]]; then
+      observation="$generation:$digest:$mounted_digest:$expected_provider:$praxis_identity"
       if [[ "$observation" == "$previous" ]]; then stable=$((stable + 1)); else stable=1; previous="$observation"; fi
       [[ "$stable" -ge 2 ]] && return 0
     else
@@ -191,12 +215,12 @@ key_json=$(${OC[@]} exec "$CLIENT" -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -- sh -c
 record 10 "API-key creation" PASS authorization "HTTP 201; key withheld"
 a_status=$(request "$KEY" "$URL" "$request_body" 2>/dev/null || true); a_body=$(${OC[@]} exec "$CLIENT" -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -- sh -c 'sed -n "s/.*host=\([^,\" ]*\).*/\1/p" /tmp/xmp-request' | head -1 || true)
 [[ "$a_status" == 200 && "$a_body" == *provider-a* ]] && record 11 "First test endpoint" PASS routing "HTTP 200; Test Provider A attribution observed" || { record 11 "First test endpoint" FAIL routing "expected HTTP 200 from first endpoint"; exit 1; }
-provider_url="http://provider-a.${OPENSHIFT_E2E_BACKEND_NAMESPACE}.svc.cluster.local:8000/v1/chat/completions"
+provider_url="https://provider-a.${OPENSHIFT_E2E_BACKEND_NAMESPACE}.svc.cluster.local/v1/chat/completions"
 provider_probe() {
   local mode=$1
   case "$mode" in
-    missing) printf '%s' "$request_body" | ${OC[@]} exec -i "$CLIENT" -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -- sh -c 'curl --silent --show-error --output /dev/null --write-out "%{http_code}" --max-time 20 -X POST "$1" -H "Content-Type: application/json" --data-binary @-' sh "$provider_url" ;;
-    wrong) printf '%s' "$request_body" | ${OC[@]} exec -i "$CLIENT" -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -- sh -c 'curl --silent --show-error --output /dev/null --write-out "%{http_code}" --max-time 20 -X POST "$1" -H "Authorization: Bearer client-override" -H "Content-Type: application/json" --data-binary @-' sh "$provider_url" ;;
+    missing) printf '%s' "$request_body" | ${OC[@]} exec -i "$CLIENT" -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -- sh -c 'curl --silent --show-error --output /dev/null --write-out "%{http_code}" --max-time 20 --cacert /etc/xmp/ca/ca.crt -X POST "$1" -H "Content-Type: application/json" --data-binary @-' sh "$provider_url" ;;
+    wrong) printf '%s' "$request_body" | ${OC[@]} exec -i "$CLIENT" -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -- sh -c 'curl --silent --show-error --output /dev/null --write-out "%{http_code}" --max-time 20 --cacert /etc/xmp/ca/ca.crt -X POST "$1" -H "Authorization: Bearer client-override" -H "Content-Type: application/json" --data-binary @-' sh "$provider_url" ;;
   esac
 }
 provider_missing=$(provider_probe missing 2>/dev/null || true)
@@ -205,30 +229,25 @@ printf '%s\n' "$provider_missing" >"$OUT/provider-missing-status.txt"
 provider_wrong=$(provider_probe wrong 2>/dev/null || true)
 printf '%s\n' "$provider_wrong" >"$OUT/provider-wrong-status.txt"
 [[ "$provider_wrong" == 401 ]] && record 22 "provider_rejects_wrong_credential" PASS provider "direct Provider A request returned HTTP 401" || { record 22 "provider_rejects_wrong_credential" FAIL provider "expected HTTP 401, observed $provider_wrong"; exit 1; }
-if [[ "$a_status" == 200 && "$a_body" == *provider-a* ]]; then
-  record 23 "client_authorization_cannot_override_provider_credential" PASS provider "caller MaaS Authorization was replaced by the distinct projected provider credential; duplicate Authorization headers are out of scope"
-else
-  record 23 "client_authorization_cannot_override_provider_credential" FAIL provider "authenticated request did not reach the credential-enforcing Provider A backend"
-  exit 1
-fi
+record 23 "client_authorization_cannot_override_provider_credential" NOT_DEMONSTRATED provider "public MaaS caller authentication consumes the single Authorization header; duplicate headers are intentionally not used"
 x_api_override=$(request_with_x_api_key_override "$KEY" "$URL" "$request_body" 2>/dev/null || true)
 x_api_override_body=$(${OC[@]} exec "$CLIENT" -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -- sh -c 'sed -n "s/.*host=\([^,\" ]*\).*/\1/p" /tmp/xmp-request' | head -1 || true)
 [[ "$x_api_override" == 200 && "$x_api_override_body" == *provider-a* ]] && record 24 "client_x_api_key_cannot_override_provider_credential" PASS provider "HTTP 200; Provider A attribution observed" || { record 24 "client_x_api_key_cannot_override_provider_credential" FAIL provider "expected attributed HTTP 200, observed $x_api_override"; exit 1; }
 if [[ "$a_status" == 200 && "$a_body" == *provider-a* && "$provider_missing" == 401 && "$provider_wrong" == 401 && "$x_api_override" == 200 ]]; then
-  record 25 "credential_enforcing_provider_chain" PASS provider "backend enforcement, caller Authorization replacement, and x-api-key resistance passed"
+  record 25 "credential_enforcing_provider_chain" NOT_DEMONSTRATED provider "backend enforcement and x-api-key resistance passed; Authorization override remains unrepresentable on the public path"
 else
   record 25 "credential_enforcing_provider_chain" FAIL provider "credential enforcement or x-api-key override resistance failed"
   exit 1
 fi
 unknown=$(request "$KEY" "https://$HOST/$OPENSHIFT_E2E_TENANT_NAMESPACE/missing-model/v1/chat/completions" '{"model":"missing-model","messages":[{"role":"user","content":"qualification"}]}' 2>/dev/null || true)
 [[ "$unknown" == 404 ]] && record 12 "Unknown model" PASS routing "HTTP 404" || { record 12 "Unknown model" FAIL routing "expected HTTP 404, observed $unknown"; exit 1; }
-before=$(${OC[@]} get pods -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -l app=praxis -o json | jq -r '.items[0] | [.metadata.uid,([.status.containerStatuses[]?.restartCount]|add // 0)] | @tsv')
+before=$(wait_json "single ready Praxis pod" "${OC[*]} get pods -n $OPENSHIFT_E2E_TENANT_NAMESPACE -l app=praxis -o json | jq -e '[.items[] | select([.status.conditions[]? | select(.type==\"Ready\" and .status==\"True\")] | length == 1)] | length == 1' >/dev/null && ${OC[*]} get pods -n $OPENSHIFT_E2E_TENANT_NAMESPACE -l app=praxis -o json | jq -r '[.items[] | select([.status.conditions[]? | select(.type==\"Ready\" and .status==\"True\")] | length == 1)] | .[0] | [.metadata.uid,([.status.containerStatuses[]?.restartCount]|add // 0)] | @tsv'" 180)
 ${OC[@]} patch externalmodel demo-model -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" --type=json -p='[{"op":"replace","path":"/spec/externalProviderRefs/0/weight","value":0},{"op":"replace","path":"/spec/externalProviderRefs/1/weight","value":1}]' >"$OUT/endpoint-switch.txt"
 wait_json "second endpoint overlay" "${OC[*]} get configmap routing-overlay -n $OPENSHIFT_E2E_TENANT_NAMESPACE -o json | jq -e '.data[\"routing-overlay.json\"] | contains(\"provider-provider-b\")' >/dev/null" 180 || { record 13-converge "Endpoint switch convergence" FAIL routing "second endpoint overlay did not converge"; exit 1; }
 wait_for_praxis_overlay b "" "" || { record 13-converge "Endpoint switch convergence" FAIL routing "second endpoint projection did not converge"; exit 1; }
 b_status=$(request "$KEY" "$URL" "$request_body" 2>/dev/null || true); b_body=$(${OC[@]} exec "$CLIENT" -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -- sh -c 'sed -n "s/.*host=\([^,\" ]*\).*/\1/p" /tmp/xmp-request' | head -1 || true)
 [[ "$b_status" == 200 && "$b_body" == *provider-b* ]] && record 13 "Second test endpoint" PASS routing "HTTP 200; Test Provider B attribution observed" || { record 13 "Second test endpoint" FAIL routing "expected HTTP 200 from second endpoint"; exit 1; }
-after=$(${OC[@]} get pods -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -l app=praxis -o json | jq -r '.items[0] | [.metadata.uid,([.status.containerStatuses[]?.restartCount]|add // 0)] | @tsv')
+after=$(wait_json "single ready Praxis pod after switch" "${OC[*]} get pods -n $OPENSHIFT_E2E_TENANT_NAMESPACE -l app=praxis -o json | jq -e '[.items[] | select([.status.conditions[]? | select(.type==\"Ready\" and .status==\"True\")] | length == 1)] | length == 1' >/dev/null && ${OC[*]} get pods -n $OPENSHIFT_E2E_TENANT_NAMESPACE -l app=praxis -o json | jq -r '[.items[] | select([.status.conditions[]? | select(.type==\"Ready\" and .status==\"True\")] | length == 1)] | .[0] | [.metadata.uid,([.status.containerStatuses[]?.restartCount]|add // 0)] | @tsv'" 180)
 [[ "$before" == "$after" ]] && record 14 "Praxis identity stable" PASS tenant "UID and restart count unchanged" || { record 14 "Praxis identity stable" FAIL tenant "before=$before after=$after"; exit 1; }
 noop_before=$(${OC[@]} get externalmodel demo-model -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -o json | jq -r '.metadata.generation')
 noop_cm_before=$(${OC[@]} get configmap routing-overlay -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -o json | jq -r '[.metadata.generation,.metadata.resourceVersion,.metadata.annotations["inference.opendatahub.io/routing-overlay-content-digest"]] | @tsv')
@@ -252,7 +271,25 @@ wait_for_praxis_overlay a "" "" || { record 18 "Provider A reset" FAIL cleanup "
 reset_status=$(request "$KEY" "$URL" "$request_body" 2>/dev/null || true); reset_body=$(${OC[@]} exec "$CLIENT" -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -- sh -c 'sed -n "s/.*host=\([^,\" ]*\).*/\1/p" /tmp/xmp-request' | head -1 || true)
 [[ "$reset_status" == 200 && "$reset_body" == *provider-a* ]] && record 19 "Provider A reset request" PASS routing "HTTP 200; first test endpoint restored" || { record 19 "Provider A reset request" FAIL routing "expected HTTP 200 from first endpoint after reset"; exit 1; }
 revoke_key && record 17 "API-key revocation" PASS authorization "HTTP 200" || { record 17 "API-key revocation" FAIL authorization "revocation failed"; exit 1; }
-if rg -i 'authorization:|sk-oai-|Bearer[[:space:]]+sk-' "$OUT" >/dev/null 2>&1; then record 20 "Credential leak scan" FAIL security "sensitive pattern found"; else record 20 "Credential leak scan" PASS security "no credential patterns found"; fi
+scan_candidates="$OUT/.credential-scan-candidates"
+rg -I -i -n 'Authorization:[[:space:]]*(Bearer|Basic)[[:space:]]+[A-Za-z0-9._~+/=-]{20,}|Bearer[[:space:]]+[A-Za-z0-9._~+/=-]{20,}|sk-[A-Za-z0-9]{16,}' "$OUT" >"$scan_candidates" 2>/dev/null || true
+if [[ -s "$scan_candidates" ]]; then
+  # The generated OpenShift CRD schema contains a documented sha256~ token
+  # example in a prose description. Exclude only that exact schema-example
+  # shape; runtime request, header, log, and response evidence remains strict.
+  filtered_candidates="$OUT/.credential-scan-filtered"
+  rg -v '"description": "authorize indicates if the proxied request should contain.*Authorization: Bearer sha256~' "$scan_candidates" >"$filtered_candidates" || true
+  if [[ -s "$filtered_candidates" ]]; then
+    printf 'status=FAIL\ncandidates=present\n' >"$OUT/credential-scan.txt"
+    record 20 "Credential leak scan" FAIL security "credential-shaped runtime evidence found"
+  else
+    printf 'status=PASS\ncandidates=generated-schema-example-only\n' >"$OUT/credential-scan.txt"
+    record 20 "Credential leak scan" PASS security "no credential values in runtime evidence; generated schema example classified separately"
+  fi
+else
+  printf 'status=PASS\ncandidates=none\n' >"$OUT/credential-scan.txt"
+  record 20 "Credential leak scan" PASS security "no credential patterns found"
+fi
 jq '.functional=(if (([.assertions[] | select(.status=="FAIL")] | length) == 0 and ([.assertions[] | select(.status=="NOT_DEMONSTRATED")] | length) == 0) then "PASS" else "PARTIAL" end) | .note="Single-tenant routing; two-tenant MaaS authorization remains issue #23"' "$RESULTS" >"$tmp"
 mv "$tmp" "$RESULTS"
 printf '%s\n' "$RESULTS"

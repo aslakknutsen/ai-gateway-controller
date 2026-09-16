@@ -6,21 +6,21 @@ STATE=${OPENSHIFT_E2E_STATE:-"$ROOT/.openshift-state"}
 source "$STATE/run.env"
 OC=(oc --kubeconfig "${OPENSHIFT_KUBECONFIG:-$STATE/kubeconfig}")
 PULL_SECRET="xmp-registry-pull-$OPENSHIFT_E2E_RUN_ID"
-AITENANT="xmp-$OPENSHIFT_E2E_RUN_ID"
-DEFAULT_TENANT=false
+AITENANT="${OPENSHIFT_E2E_AITENANT_NAME:-xmp-$OPENSHIFT_E2E_RUN_ID}"
+SHARED_AITENANT=false
 AITENANT_RETAINED=false
 # A recorded original snapshot is authoritative for runs that predate the
 # persisted AITENANT_NAME field. Never enter the deletion path for the shared
-# default tenant when that snapshot exists.
+# shared MaaS AITenant when that snapshot exists.
 if [[ "${OPENSHIFT_E2E_AITENANT_NAME:-}" == models-as-a-service || -s "$STATE/aitenant-original.json" ]]; then
-  DEFAULT_TENANT=true
+  SHARED_AITENANT=true
   AITENANT=models-as-a-service
 fi
 if "${OC[@]}" get aitenant "$AITENANT" -n ai-tenants -o json >"$STATE/destroy-aitenant.json" 2>/dev/null; then
-  if [[ "$DEFAULT_TENANT" == true ]]; then
+    if [[ "$SHARED_AITENANT" == true ]]; then
     if ! jq -e --arg run "$OPENSHIFT_E2E_RUN_ID" '.metadata.labels["external-model-praxis.opendatahub.io/run-id"] == $run and .metadata.labels["app.kubernetes.io/managed-by"] == "external-model-praxis-openshift-e2e"' "$STATE/destroy-aitenant.json" >/dev/null; then
-      jq -e --slurpfile original "$STATE/aitenant-original.json" '(.metadata.labels // {}) == ($original[0].metadata.labels // {}) and (.metadata.annotations // {}) == ($original[0].metadata.annotations // {})' "$STATE/destroy-aitenant.json" >/dev/null || { echo "default AITenant was not opted in by this run or already restored" >&2; exit 1; }
-      DEFAULT_TENANT_ALREADY_RESTORED=true
+      jq -e --slurpfile original "$STATE/aitenant-original.json" '(.metadata.labels // {}) == ($original[0].metadata.labels // {}) and (.metadata.annotations // {}) == ($original[0].metadata.annotations // {})' "$STATE/destroy-aitenant.json" >/dev/null || { echo "shared AITenant was not opted in by this run or was already restored" >&2; exit 1; }
+      SHARED_AITENANT_ALREADY_RESTORED=true
       AITENANT_RETAINED=true
     fi
   else
@@ -31,7 +31,7 @@ if "${OC[@]}" get aitenant "$AITENANT" -n ai-tenants -o json >"$STATE/destroy-ai
   [[ -z "$resolved" ]] || OPENSHIFT_E2E_TENANT_NAMESPACE=$resolved
 fi
 for ns in "$OPENSHIFT_E2E_CONTROLLER_NAMESPACE" "$OPENSHIFT_E2E_TENANT_NAMESPACE" "$OPENSHIFT_E2E_BACKEND_NAMESPACE"; do
-  if [[ "$DEFAULT_TENANT" == true && "$ns" == models-as-a-service ]]; then continue; fi
+  if [[ "$SHARED_AITENANT" == true && "$ns" == models-as-a-service ]]; then continue; fi
   [[ "$ns" == xmp-controller-$OPENSHIFT_E2E_RUN_ID || "$ns" == xmp-provider-$OPENSHIFT_E2E_RUN_ID || "$ns" == xmp-tenant-$OPENSHIFT_E2E_RUN_ID || "$ns" == ai-tenant-xmp-$OPENSHIFT_E2E_RUN_ID ]] || { echo "refusing unvalidated namespace: $ns" >&2; exit 1; }
   if "${OC[@]}" get namespace "$ns" -o json >"$STATE/destroy-namespace.json" 2>/dev/null; then
     jq -e --arg run "$OPENSHIFT_E2E_RUN_ID" '(.metadata.labels["external-model-praxis.opendatahub.io/run-id"] == $run) or (.metadata.labels["maas.opendatahub.io/tenant-name"] == ("xmp-" + $run) and .metadata.annotations["maas.opendatahub.io/created-by-aitenant"] == "true")' "$STATE/destroy-namespace.json" >/dev/null || { echo "ownership check failed: $ns" >&2; exit 1; }
@@ -50,14 +50,14 @@ cleanup_failed=0
 # The AITenant finalizer is serviced by the run-owned controller.  Keep the
 # controller, tenant namespace, and Gateway alive until the object disappears;
 # deleting any of them first strands the finalizer and makes cleanup unsafe.
-if [[ "$DEFAULT_TENANT" == true && "${DEFAULT_TENANT_ALREADY_RESTORED:-false}" != true ]]; then
+if [[ "$SHARED_AITENANT" == true && "${SHARED_AITENANT_ALREADY_RESTORED:-false}" != true ]]; then
   original="$STATE/aitenant-original.json"
-  [[ -s "$original" ]] || { echo "refusing default-tenant cleanup: original metadata is missing" >&2; exit 1; }
+  [[ -s "$original" ]] || { echo "refusing shared AITenant cleanup: original metadata is missing" >&2; exit 1; }
   OUT="$OPENSHIFT_E2E_EVIDENCE_ROOT/cleanup-$(date -u +%Y%m%dT%H%M%SZ)"
   mkdir -p "$OUT"
-  "${OC[@]}" get aitenant "$AITENANT" -n ai-tenants -o json >"$OUT/default-tenant-before-restore.json"
-  jq -n --slurpfile original "$original" '[{op:"replace",path:"/metadata/labels",value:$original[0].metadata.labels},{op:"replace",path:"/metadata/annotations",value:$original[0].metadata.annotations}]' >"$OUT/default-tenant-restore-patch.json"
-  "${OC[@]}" patch aitenant "$AITENANT" -n ai-tenants --type=json --patch-file "$OUT/default-tenant-restore-patch.json" >"$OUT/default-tenant-restore.log"
+  "${OC[@]}" get aitenant "$AITENANT" -n ai-tenants -o json >"$OUT/shared-aitenant-before-restore.json"
+  jq -n --slurpfile original "$original" '[{op:"replace",path:"/metadata/labels",value:$original[0].metadata.labels},{op:"replace",path:"/metadata/annotations",value:$original[0].metadata.annotations}]' >"$OUT/shared-aitenant-restore-patch.json"
+  "${OC[@]}" patch aitenant "$AITENANT" -n ai-tenants --type=json --patch-file "$OUT/shared-aitenant-restore-patch.json" >"$OUT/shared-aitenant-restore.log"
   deadline=$((SECONDS + 180))
   restored=false
   while (( SECONDS < deadline )); do
@@ -68,8 +68,8 @@ if [[ "$DEFAULT_TENANT" == true && "${DEFAULT_TENANT_ALREADY_RESTORED:-false}" !
     fi
     sleep 3
   done
-  [[ "$restored" == true ]] || { echo "default tenant metadata did not restore" >&2; exit 1; }
-  echo "default AITenant metadata restored; shared tenant and namespace retained" >"$OUT/default-tenant-restored.txt"
+  [[ "$restored" == true ]] || { echo "shared AITenant metadata did not restore" >&2; exit 1; }
+  echo "shared MaaS AITenant metadata restored; tenant and namespace retained" >"$OUT/shared-aitenant-restored.txt"
   AITENANT_RETAINED=true
 fi
 if [[ "$AITENANT_RETAINED" != true ]] && "${OC[@]}" get aitenant "$AITENANT" -n ai-tenants -o name >/dev/null 2>&1; then
@@ -107,7 +107,7 @@ fi
 # At this point the AITenant is gone.  Only run-owned residual resources may be
 # removed, and every namespace was ownership-checked above.
 for ns in "$OPENSHIFT_E2E_CONTROLLER_NAMESPACE" "$OPENSHIFT_E2E_TENANT_NAMESPACE" "$OPENSHIFT_E2E_BACKEND_NAMESPACE"; do
-  if [[ "$DEFAULT_TENANT" == true && "$ns" == models-as-a-service ]]; then
+  if [[ "$SHARED_AITENANT" == true && "$ns" == models-as-a-service ]]; then
     "${OC[@]}" get all -n "$ns" -l "external-model-praxis.opendatahub.io/run-id=$OPENSHIFT_E2E_RUN_ID" -o json >"$OUT/$ns-run-owned-before.json" 2>/dev/null || :
     for resource in maasauthpolicy maassubscription maasmodelref externalmodel externalprovider pod configmap secret; do
       "${OC[@]}" delete "$resource" -n "$ns" -l "external-model-praxis.opendatahub.io/run-id=$OPENSHIFT_E2E_RUN_ID" --ignore-not-found >/dev/null 2>&1 || cleanup_failed=1
@@ -223,8 +223,8 @@ for resource in \
     echo "run-owned resource remains: $resource" >>"$OUT/cleanup-errors.txt"
   fi
 done
-if [[ "$DEFAULT_TENANT" == true ]]; then
-  # The shared default tenant namespace is intentionally retained; only
+if [[ "$SHARED_AITENANT" == true ]]; then
+  # The shared MaaS AITenant namespace is intentionally retained; only
   # dedicated run namespaces count as cleanup residue in this mode.
   sed -i '/^namespace\/models-as-a-service$/d' "$OUT/remaining.txt"
 fi

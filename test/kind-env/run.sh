@@ -17,7 +17,14 @@ fi
 KATAN_PULL_IMAGE=${KATAN_IMAGE:-$KATAN_DEFAULT_AMD64_IMAGE}
 PRAXIS_REPO=${PRAXIS_REPO:-"$WORKSPACE/praxis-ai"}
 PRAXIS_EFFECTIVE_IMAGE=${PRAXIS_IMAGE:-praxis-ai:overlay-e2e}
-MAAS_CONTROLLER_REPO=${MAAS_CONTROLLER_REPO:-"$WORKSPACE/models-as-a-service"}
+MAAS_UPSTREAM_URL=${MAAS_UPSTREAM_URL:-https://github.com/opendatahub-io/models-as-a-service.git}
+if [[ -n "${MAAS_CONTROLLER_REPO:-}" ]]; then
+  MAAS_SOURCE_MODE=explicit-override
+else
+  MAAS_CONTROLLER_REPO="$DEPS_DIR/models-as-a-service"
+  MAAS_SOURCE_MODE=canonical-main
+fi
+APPLY_REAL_OPENAI_FIXTURE=${APPLY_REAL_OPENAI_FIXTURE:-false}
 KSERVE_REPO=${KSERVE_REPO:-"$DEPS_DIR/kserve"}
 KUADRANT_OPERATOR_REPO=${KUADRANT_OPERATOR_REPO:-"$DEPS_DIR/kuadrant-operator"}
 PRAXIS_EXTPROC_REPO=${PRAXIS_EXTPROC_REPO:-"$DEPS_DIR/praxis-extproc"}
@@ -89,11 +96,45 @@ if [[ "${1:---preflight}" == "--destroy" ]]; then
   exit 0
 fi
 
-for cmd in docker kind kubectl helm kustomize go git openssl yq; do check_cmd "$cmd"; done
+for cmd in docker kind kubectl helm kustomize go git openssl yq envsubst; do check_cmd "$cmd"; done
 check_cmd "$ISTIOCTL"
-check_repo MAAS_CONTROLLER_REPO "$MAAS_CONTROLLER_REPO"
 check_repo KSERVE_REPO "$KSERVE_REPO"
 mkdir -p "$EVIDENCE_ROOT/.image-inputs"
+
+if [[ "$MAAS_SOURCE_MODE" == canonical-main ]]; then
+  if [[ ! -d "$MAAS_CONTROLLER_REPO/.git" ]]; then
+    timeout 600s git clone "$MAAS_UPSTREAM_URL" "$MAAS_CONTROLLER_REPO" || fail "canonical MaaS clone failed"
+  else
+    maas_remote=$(git -C "$MAAS_CONTROLLER_REPO" remote get-url origin 2>/dev/null || true)
+    [[ "$maas_remote" == "$MAAS_UPSTREAM_URL" ]] || fail "default MaaS checkout has unexpected origin: ${maas_remote:-missing}"
+    if [[ -n "$(git -C "$MAAS_CONTROLLER_REPO" status --porcelain)" ]]; then
+      fail "default canonical MaaS checkout is dirty; use MAAS_CONTROLLER_REPO for an explicit checkout"
+    else
+      timeout 600s git -C "$MAAS_CONTROLLER_REPO" fetch --prune origin main || fail "canonical MaaS fetch failed"
+      git -C "$MAAS_CONTROLLER_REPO" checkout --detach origin/main || fail "canonical MaaS checkout failed"
+    fi
+  fi
+fi
+if [[ ! -d "$MAAS_CONTROLLER_REPO/deployment/base/maas-controller/default" ]]; then
+  fail "selected MaaS source lacks deployment/base/maas-controller/default"
+fi
+if [[ ! -d "$MAAS_CONTROLLER_REPO/maas-api/deploy/overlays/xks" ]]; then
+  fail "selected MaaS source lacks maas-api/deploy/overlays/xks"
+fi
+if ! rg -q 'aitenants\.maas\.opendatahub\.io' "$MAAS_CONTROLLER_REPO"; then
+  fail "selected MaaS source lacks the canonical AITenant CRD"
+fi
+{
+  git -C "$MAAS_CONTROLLER_REPO" remote -v
+  printf 'source_mode=%s\n' "$MAAS_SOURCE_MODE"
+  printf 'branch=%s\n' "$(git -C "$MAAS_CONTROLLER_REPO" symbolic-ref --short -q HEAD || echo DETACHED)"
+  printf 'sha=%s\n' "$(git -C "$MAAS_CONTROLLER_REPO" rev-parse HEAD)"
+} >"$EVIDENCE/maas-source.txt"
+dirty_hash "$MAAS_CONTROLLER_REPO" >"$EVIDENCE/maas-controller.diff.sha256"
+printf '%s\n' "$MAAS_SOURCE_MODE" >"$EVIDENCE/maas-source-mode.txt"
+if [[ "$APPLY_REAL_OPENAI_FIXTURE" == true && ",${PRAXIS_EXTRA_KNOWN_CLUSTERS:-}," != *,provider-openai,* ]]; then
+  fail "real OpenAI fixture requires PRAXIS_EXTRA_KNOWN_CLUSTERS=provider-openai"
+fi
 
 if docker info --format '{{.Architecture}} {{.NCPU}} {{.MemTotal}}' >"$EVIDENCE/docker.txt" 2>&1; then
   read -r arch cpus memory <"$EVIDENCE/docker.txt" || true
@@ -249,6 +290,28 @@ if [[ "${1:---preflight}" == "--provision" ]]; then
   # Keep the MaaS controller/API HTTPS contract intact on Kind. Only the
   # namespace and local image substitutions are harness concerns; validation
   # URLs, secure ports, and TLS settings must remain those rendered upstream.
+  # The canonical MaaS controller base requires the OpenShift/service-ca
+  # generated Secrets below. Kind has neither service-ca nor the OpenShift
+  # certificate controller, so provision equivalent run-owned certificates
+  # before applying the Deployment. This avoids starting a controller whose
+  # required projected volumes cannot mount if provisioning is interrupted.
+  controller_tls_tmp=$(mktemp -d)
+  openssl req -x509 -nodes -newkey rsa:2048 -days 2 \
+    -keyout "$controller_tls_tmp/tls.key" -out "$controller_tls_tmp/tls.crt" \
+    -subj '/CN=maas-controller-webhook-service.maas-system.svc' \
+    -addext 'basicConstraints=critical,CA:FALSE' \
+    -addext 'keyUsage=critical,digitalSignature,keyEncipherment' \
+    -addext 'extendedKeyUsage=serverAuth' \
+    -addext 'subjectAltName=DNS:maas-controller-webhook-service,DNS:maas-controller-webhook-service.maas-system.svc,DNS:maas-controller-webhook-service.maas-system.svc.cluster.local,DNS:maas-controller-metrics,DNS:maas-controller-metrics.maas-system.svc,DNS:maas-controller-metrics.maas-system.svc.cluster.local' >/dev/null 2>&1
+  openssl x509 -in "$controller_tls_tmp/tls.crt" -noout -issuer -subject -serial -fingerprint -sha256 -ext subjectAltName \
+    >"$EVIDENCE/maas-controller-certificate.txt"
+  sha256sum "$controller_tls_tmp/tls.crt" >"$EVIDENCE/maas-controller-certificate.sha256"
+  "${KCTL[@]}" -n maas-system create secret tls maas-controller-webhook-cert \
+    --cert="$controller_tls_tmp/tls.crt" --key="$controller_tls_tmp/tls.key" \
+    --dry-run=client -o yaml | "${KCTL[@]}" apply -f -
+  "${KCTL[@]}" -n maas-system create secret tls maas-controller-metrics-tls \
+    --cert="$controller_tls_tmp/tls.crt" --key="$controller_tls_tmp/tls.key" \
+    --dry-run=client -o yaml | "${KCTL[@]}" apply -f -
   kustomize build "$MAAS_CONTROLLER_REPO/deployment/base/maas-controller/default" | sed -e "s#quay.io/opendatahub/maas-api:latest#${MAAS_API_IMAGE:-maas-api:external-model-two-plane}#g" -e "s#quay.io/opendatahub/maas-controller:latest#${MAAS_CONTROLLER_IMAGE:-maas-controller:external-model-two-plane}#g" -e "s#quay.io/opendatahub/maas-controller:odh-stable#${MAAS_CONTROLLER_IMAGE:-maas-controller:external-model-two-plane}#g" -e 's#openshift-ingress#maas-system#g' -e 's#namespace: opendatahub#namespace: maas-system#g' -e 's#namespace: system#namespace: maas-system#g' | yq eval 'select(.kind != "ServiceMonitor" and .kind != "ValidatingWebhookConfiguration")' - >"$EVIDENCE/maas-controller-kind-rendered.yaml"
   "${KCTL[@]}" apply -f "$EVIDENCE/maas-controller-kind-rendered.yaml"
   "${KCTL[@]}" -n maas-system patch deployment maas-api --type=json -p='[{"op":"replace","path":"/spec/template/spec/containers/0/imagePullPolicy","value":"Never"}]' 2>/dev/null || true
@@ -272,7 +335,7 @@ if [[ "${1:---preflight}" == "--provision" ]]; then
   # validation for Authorino's HTTPS metadata evaluator.
   openssl req -x509 -nodes -newkey rsa:2048 -days 2 \
     -keyout "$db_tmp/ca.key" -out "$db_tmp/ca.crt" \
-    -subj "/CN=external-model-e2e-${CLUSTER}-ca" \
+    -subj '/CN=external-model-e2e-ca' \
     -addext 'basicConstraints=critical,CA:TRUE,pathlen:1' \
     -addext 'keyUsage=critical,keyCertSign,cRLSign' >/dev/null 2>&1
   openssl req -new -nodes -newkey rsa:2048 \
@@ -321,9 +384,6 @@ EOF
   [[ "$authorino_found" == true ]] || { fail "Kuadrant did not create the run-owned Authorino resource"; exit 2; }
   "${KCTL[@]}" -n kuadrant-system patch authorino authorino --type=merge -p='{"spec":{"volumes":{"defaultMode":420,"items":[{"name":"maas-api-serving-ca","mountPath":"/etc/ssl/certs","configMaps":["authorino-maas-api-ca"],"items":[{"key":"ca.crt","path":"maas-api-serving-ca.crt"}]}]}}}'
   "${KCTL[@]}" -n kuadrant-system get authorino authorino -o yaml >"$EVIDENCE/authorino-ca-config.yaml"
-  "${KCTL[@]}" -n maas-system create secret tls maas-controller-webhook-cert --cert="$db_tmp/tls.crt" --key="$db_tmp/tls.key" --dry-run=client -o yaml | "${KCTL[@]}" apply -f -
-  "${KCTL[@]}" -n maas-system create secret tls maas-controller-webhook-cert --cert="$db_tmp/tls.crt" --key="$db_tmp/tls.key" --dry-run=client -o yaml | "${KCTL[@]}" apply -f -
-  "${KCTL[@]}" -n maas-system create secret tls maas-controller-metrics-tls --cert="$db_tmp/tls.crt" --key="$db_tmp/tls.key" --dry-run=client -o yaml | "${KCTL[@]}" apply -f -
   kustomize build "$MAAS_CONTROLLER_REPO/deployment/base/maas-api/rbac" | sed 's#namespace: opendatahub#namespace: maas-system#g' | "${KCTL[@]}" apply -f -
   "${KCTL[@]}" apply -f "$ROOT/test/kind-env/manifests/31-maas-api-kind-rbac.yaml"
   # The webhook Secret is created after the OpenShift-only bundle is rendered;
@@ -336,9 +396,17 @@ EOF
   kustomize build "$ROOT/config/crd" | "${KCTL[@]}" apply --server-side -f -
   kustomize build "$ROOT/config/self/default" | "${KCTL[@]}" apply --server-side --force-conflicts -f -
   "${KCTL[@]}" -n opendatahub set image deployment/ai-gateway-controller manager="${AI_CONTROLLER_IMAGE:-ai-gateway-controller:external-model-two-plane}"
-  controller_patch=$(jq -cn --arg praxis_image "$PRAXIS_EFFECTIVE_IMAGE" --arg extproc_image "${EXTPROC_IMAGE:-praxis-extproc:dev}" '[
+  extra_known_json='[]'
+  if [[ -n "${PRAXIS_EXTRA_KNOWN_CLUSTERS:-}" ]]; then
+    IFS=',' read -r -a extra_known_clusters <<<"$PRAXIS_EXTRA_KNOWN_CLUSTERS"
+    for extra_cluster in "${extra_known_clusters[@]}"; do
+      [[ -n "$extra_cluster" ]] || continue
+      extra_known_json=$(jq -c --arg cluster "$extra_cluster" '. + ["--known-cluster=" + $cluster]' <<<"$extra_known_json")
+    done
+  fi
+  controller_patch=$(jq -cn --arg praxis_image "$PRAXIS_EFFECTIVE_IMAGE" --arg extproc_image "${EXTPROC_IMAGE:-praxis-extproc:dev}" --argjson extra_known "$extra_known_json" '[
     {op:"replace",path:"/spec/template/spec/containers/0/imagePullPolicy",value:"Never"},
-    {op:"replace",path:"/spec/template/spec/containers/0/args",value:[
+    {op:"replace",path:"/spec/template/spec/containers/0/args",value:([
       "--leader-elect",
       "--health-probe-bind-address=:8081",
       "--gateway-name=maas-default-gateway",
@@ -346,10 +414,13 @@ EOF
       "--known-cluster=provider-provider-a",
       "--known-cluster=provider-provider-b",
       "--known-cluster=provider-transition-provider",
+      "--praxis-plaintext-cluster=provider-provider-a",
+      "--praxis-plaintext-cluster=provider-provider-b",
+      "--praxis-plaintext-cluster=provider-transition-provider",
       ("--image=" + $extproc_image),
       ("--praxis-image=" + $praxis_image),
       "--praxis-image-pull-policy=Never"
-    ]}
+    ] + $extra_known)}
   ]')
   "${KCTL[@]}" -n opendatahub patch deployment ai-gateway-controller --type=json -p="$controller_patch"
   # Standalone Praxis is now rendered and owned by ai-gateway-controller from
@@ -360,7 +431,7 @@ EOF
   # MaaS materialize its per-tenant IPP operands, then the handoff below can
   # stop them before an IPP writer ever sees an ExternalModel and creates a
   # competing direct-provider HTTPRoute.
-  for manifest in "$ROOT/test/kind-env/manifests/20-fixtures.yaml" "$ROOT/test/kind-env/manifests/21-fixtures-tenant-b.yaml"; do
+  for manifest in "$ROOT/test/kind-env/manifests/20-fixtures.yaml" "$ROOT/test/kind-env/manifests/21-fixtures-tenant-b.yaml" "$ROOT/test/kind-env/manifests/42-transition-fixtures.yaml"; do
     yq eval 'select(.kind == "AITenant")' "$manifest" | "${KCTL[@]}" apply -f -
   done
   for tenant_id in "" tenant-b; do
@@ -422,7 +493,8 @@ EOF
   # not let the disabled IPP deployment observe the Praxis ExternalModels.
   for manifest in "$ROOT/test/kind-env/manifests"/*.yaml; do
     case "$(basename "$manifest")" in
-      10-praxis.yaml|11-praxis-tenant-b.yaml|12-praxis-transition.yaml|20-fixtures.yaml|21-fixtures-tenant-b.yaml|40-maas-fixtures.yaml|41-maas-fixtures-tenant-b.yaml) continue ;;
+      10-praxis.yaml|11-praxis-tenant-b.yaml|12-praxis-transition.yaml|20-fixtures.yaml|21-fixtures-tenant-b.yaml|40-maas-fixtures.yaml|41-maas-fixtures-tenant-b.yaml|42-transition-fixtures.yaml) continue ;;
+      45-real-openai-policies.yaml|60-client-kind-patch.yaml) continue ;;
     esac
     if [[ "$(basename "$manifest")" == 00-backends.yaml ]]; then
       # Kind runs the platform-pulled local image. The immutable public
@@ -434,6 +506,27 @@ EOF
       "${KCTL[@]}" apply -f "$manifest"
     fi
   done
+  # shellcheck disable=SC2016
+  EXTERNAL_MODEL_NAMESPACE=models-as-a-service \
+  EXTERNAL_MODEL_RUN_ID="$CLUSTER" \
+  EXTERNAL_MODEL_PROVIDER_A_ENDPOINT=provider-a.maas-system.svc.cluster.local \
+  EXTERNAL_MODEL_PROVIDER_B_ENDPOINT=provider-b.maas-system.svc.cluster.local \
+    envsubst '${EXTERNAL_MODEL_NAMESPACE} ${EXTERNAL_MODEL_PROVIDER_A_ENDPOINT} ${EXTERNAL_MODEL_PROVIDER_B_ENDPOINT} ${EXTERNAL_MODEL_RUN_ID}' \
+      <"$ROOT/test/external-model/providers.yaml.tmpl" | "${KCTL[@]}" apply -f -
+  if [[ "$APPLY_REAL_OPENAI_FIXTURE" == true ]]; then
+    # This fixture is intentionally explicit: it expands the allowlist with
+    # provider-openai and must never be pulled into the ordinary glob above.
+    # shellcheck disable=SC2016
+    EXTERNAL_MODEL_NAMESPACE=models-as-a-service \
+    EXTERNAL_MODEL_RUN_ID="$CLUSTER" \
+    EXTERNAL_MODEL_OPENAI_SECRET=openai-provider-credentials \
+    EXTERNAL_MODEL_OPENAI_SUBSCRIPTION=openai-e2e-subscription \
+    EXTERNAL_MODEL_OPENAI_POLICY=openai-e2e-access \
+    EXTERNAL_MODEL_OPENAI_USER=kind-user \
+      envsubst '${EXTERNAL_MODEL_NAMESPACE} ${EXTERNAL_MODEL_OPENAI_SECRET} ${EXTERNAL_MODEL_OPENAI_SUBSCRIPTION} ${EXTERNAL_MODEL_OPENAI_POLICY} ${EXTERNAL_MODEL_OPENAI_USER} ${EXTERNAL_MODEL_RUN_ID}' \
+        <"$ROOT/test/external-model/openai.yaml.tmpl" | "${KCTL[@]}" apply -f -
+    "${KCTL[@]}" apply -f "$ROOT/test/kind-env/manifests/45-real-openai-policies.yaml"
+  fi
   # MaaS creates one existing-IPP deployment per tenant. The upstream IPP
   # runner supports a namespace-scoped cache and explicit Gateway settings;
   # provide those only in this Kind fixture.  Keep IPP disabled for tenants
@@ -477,6 +570,10 @@ EOF
   if "${KCTL[@]}" -n maas-system get deployment/payload-pre-processing >/dev/null 2>&1; then "${KCTL[@]}" -n maas-system rollout status deployment/payload-pre-processing --timeout=120s; fi
   if "${KCTL[@]}" -n maas-system get deployment/payload-pre-processing-tenant-b >/dev/null 2>&1; then "${KCTL[@]}" -n maas-system rollout status deployment/payload-pre-processing-tenant-b --timeout=120s; fi
   "${KCTL[@]}" -n maas-system rollout status deployment/payload-pre-processing-transition --timeout=120s
+  # Apply the transition IPP resources only after its writer has the
+  # run-owned Gateway settings. Applying the ExternalModel earlier lets the
+  # IPP reconciler publish a route against its default OpenShift Gateway.
+  yq eval 'select(.kind != "AITenant")' "$ROOT/test/kind-env/manifests/42-transition-fixtures.yaml" | "${KCTL[@]}" apply -f -
   # Apply Praxis-tenant MaaS model references only after their IPP writers have
   # been disabled and rolled out. Otherwise the old IPP ExternalModel watcher
   # can observe the reference first and create a competing direct-provider

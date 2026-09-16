@@ -205,6 +205,36 @@ func validRoutingOverlay(t *testing.T, namespace string) *corev1.ConfigMap {
 	}
 }
 
+func routingOverlayForProvider(t *testing.T, namespace, provider string) *corev1.ConfigMap {
+	t.Helper()
+	env, err := envelope.Render(&resolver.ResolvedRouteSet{Models: []resolver.ModelRoutes{{
+		ModelRef: namespace + "/demo-model",
+		Routes: []resolver.Route{{
+			Model: "demo-model", ClientName: "demo", Namespace: namespace,
+			Provider: provider, Cluster: "provider-" + provider,
+			ProviderType: "openai", Endpoint: provider + ".example.com",
+			TargetModel: "demo", APIFormat: "openai-chat", Path: "/v1/chat/completions",
+			Weight: 1, AuthType: "apikey", SecretName: "credentials", SecretKey: "api-key",
+		}},
+	}}}, envelope.Scope{
+		Network: "external-model", Gateway: "my-gateway", Namespace: namespace, LocalSite: "local",
+	}, envelope.Revision{}, envelope.Options{SourceUID: "tenant-uid"})
+	if err != nil {
+		t.Fatalf("Render provider overlay: %v", err)
+	}
+	raw, err := json.Marshal(env)
+	if err != nil {
+		t.Fatalf("marshal provider overlay: %v", err)
+	}
+	return &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: praxisOverlayName, Namespace: namespace,
+			Labels: map[string]string{managedByLabel: render.FieldOwner},
+		},
+		Data: map[string]string{praxisOverlayDataKey: string(raw)},
+	}
+}
+
 func getTenantPraxisDeployment(t *testing.T, c client.Client, namespace, tenantID string) *unstructured.Unstructured {
 	t.Helper()
 	deployment := &unstructured.Unstructured{}
@@ -273,6 +303,21 @@ func TestReconcileCreatesPraxisDeploymentForValidOverlay(t *testing.T) {
 		return
 	}
 	t.Fatalf("routing overlay volume missing from Deployment: %#v", volumes)
+}
+
+func TestRoutingOverlayReadyDoesNotRequireDisabledProvider(t *testing.T) {
+	const namespace = "tenant-ns"
+	overlay := routingOverlayForProvider(t, namespace, "provider-a")
+	fakeClient := fake.NewClientBuilder().WithScheme(aitenantSchemeForTests()).WithObjects(overlay).Build()
+	r := &Reconciler{Client: fakeClient}
+
+	ready, reason, err := r.routingOverlayReady(context.Background(), namespace, map[string]bool{"provider-a": true})
+	if err != nil {
+		t.Fatalf("routingOverlayReady: %v", err)
+	}
+	if !ready || reason == "" {
+		t.Fatalf("routingOverlayReady = %t, %q; want ready", ready, reason)
+	}
 }
 
 func TestReconcileRejectsInvalidOrForeignOverlayForPraxisDeployment(t *testing.T) {

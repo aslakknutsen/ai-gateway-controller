@@ -174,30 +174,14 @@ fi
 mutate -n kuadrant-system get configmap authorino-maas-api-ca -o json \
   | jq 'del(.metadata.creationTimestamp,.metadata.resourceVersion,.metadata.uid,.metadata.managedFields,.metadata.ownerReferences) | .metadata.name="demo-maas-api-ca" | .metadata.namespace="maas-system"' \
   | mutate apply -f - >/dev/null
-mutate apply -f - <<EOF >/dev/null
-apiVersion: v1
-kind: Pod
-metadata:
-  name: $CLIENT
-  namespace: $CLIENT_NS
-  labels:
-    app.kubernetes.io/managed-by: local-env
-    local-env.opendatahub.io/purpose: narrative-demo-client
-spec:
-  automountServiceAccountToken: false
-  restartPolicy: Always
-  securityContext: {runAsUser: 1000, runAsGroup: 1000, runAsNonRoot: true, seccompProfile: {type: RuntimeDefault}}
-  containers:
-  - name: curl
-    image: curlimages/curl:8.10.1
-    imagePullPolicy: IfNotPresent
-    command: ["/bin/sh", "-c", "trap : TERM INT; sleep 2147483647 & wait"]
-    securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}}
-    volumeMounts: [{name: maas-ca, mountPath: /etc/demo-ca, readOnly: true}]
-  volumes:
-  - name: maas-ca
-    configMap: {name: demo-maas-api-ca, items: [{key: ca.crt, path: ca.crt}]}
-EOF
+# shellcheck disable=SC2016
+EXTERNAL_MODEL_CLIENT_NAME=$CLIENT \
+EXTERNAL_MODEL_CLIENT_NAMESPACE=$CLIENT_NS \
+EXTERNAL_MODEL_CLIENT_IMAGE='curlimages/curl:8.10.1' \
+EXTERNAL_MODEL_CLIENT_VOLUME_MOUNTS='[{name: maas-ca, mountPath: /etc/demo-ca, readOnly: true}]' \
+EXTERNAL_MODEL_CLIENT_VOLUMES='[{name: maas-ca, configMap: {name: demo-maas-api-ca, items: [{key: ca.crt, path: ca.crt}]}}]' \
+  envsubst '${EXTERNAL_MODEL_CLIENT_NAME} ${EXTERNAL_MODEL_CLIENT_NAMESPACE} ${EXTERNAL_MODEL_CLIENT_IMAGE} ${EXTERNAL_MODEL_CLIENT_VOLUME_MOUNTS} ${EXTERNAL_MODEL_CLIENT_VOLUMES}' \
+    <"$ROOT/test/external-model/client.yaml.tmpl" | mutate apply -f - >/dev/null
 wait_pod_ready "$CLIENT_NS" "$CLIENT" || fail_stage "client pod readiness"
 path="/$TENANT/demo/v1/chat/completions"
 unauth=$(client_exec sh -c "curl --connect-timeout 5 --max-time 15 -sS -o /tmp/unauth -w '%{http_code}' -H 'content-type: application/json' --data '{\"model\":\"demo\",\"messages\":[]}' 'http://maas-default-gateway.$GATEWAY_NS.svc.cluster.local$path' || printf 000" 2>/dev/null || true)

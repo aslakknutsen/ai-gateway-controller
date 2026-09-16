@@ -364,6 +364,27 @@ fi
 "${OC[@]}" rollout restart deployment/kuadrant-operator-controller-manager -n kuadrant-system >"$OUT/kuadrant-restart.log" 2>&1
 "${OC[@]}" rollout status deployment/kuadrant-operator-controller-manager -n kuadrant-system --timeout=300s >>"$OUT/kuadrant-restart.log" 2>&1
 
+# Authorino can become Ready after the Kuadrant controller has already
+# completed its initial dependency discovery.  Do not let a later request
+# assertion observe an unauthenticated 200 while Kuadrant still reports a
+# dependency failure.  The CR status is the state-based readiness contract;
+# this wait is intentionally bounded and records the final status for review.
+KUADRANT_READY_EVIDENCE="$OUT/kuadrant-ready.json"
+KUADRANT_READY_DEADLINE=$((SECONDS + 300))
+while :; do
+  KUADRANT_STATUS=$("${OC[@]}" get kuadrant kuadrant -n kuadrant-system -o json 2>/dev/null || true)
+  if [[ -n "$KUADRANT_STATUS" ]] && jq -e '[.status.conditions[]? | select(.type == "Ready" and .status == "True")] | length == 1' <<<"$KUADRANT_STATUS" >/dev/null; then
+    printf '%s\n' "$KUADRANT_STATUS" >"$KUADRANT_READY_EVIDENCE"
+    break
+  fi
+  if (( SECONDS >= KUADRANT_READY_DEADLINE )); then
+    printf '%s\n' "${KUADRANT_STATUS:-{}}" >"$KUADRANT_READY_EVIDENCE"
+    echo "Kuadrant did not report Ready after Authorino and operand readiness; diagnostics: $KUADRANT_READY_EVIDENCE" >&2
+    exit 1
+  fi
+  sleep 3
+done
+
 kustomize build "$KSERVE_REPO/config/crd/minimal" | "${OC[@]}" apply --server-side -f - >"$OUT/kserve-crds.log" 2>&1
 
 # The fresh CI cluster does not expose the internal registry by default. This

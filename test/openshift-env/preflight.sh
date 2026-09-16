@@ -5,6 +5,11 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 STATE=${OPENSHIFT_E2E_STATE:-"$ROOT/.openshift-state"}
 KUBECONFIG_FILE=${OPENSHIFT_KUBECONFIG:-"$STATE/kubeconfig"}
 RUN_ID=${OPENSHIFT_E2E_RUN_ID:-"$(date -u +%Y%m%d%H%M%S)-$RANDOM"}
+# OpenShift resource names are DNS-1123 values. Keep the human-selected run
+# identity for evidence only after normalizing it once at the boundary so all
+# derived namespaces, routes, SCCs, and image tags are valid resource names.
+RUN_ID=$(printf '%s' "$RUN_ID" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9-]+/-/g; s/^-+//; s/-+$//' | cut -c1-48)
+[[ -n "$RUN_ID" ]] || { echo "OPENSHIFT_E2E_RUN_ID must contain at least one DNS-1123 character" >&2; exit 1; }
 EVIDENCE="$STATE/evidence/$RUN_ID/baseline"
 mkdir -p "$EVIDENCE"
 

@@ -465,7 +465,7 @@ func TestWaitForForeignOwnershipAcceptsReleasedPluginConfigMap(t *testing.T) {
 		"apiVersion": "v1",
 		"kind":       "ConfigMap",
 		"metadata": map[string]any{
-			"name":      PayloadProcessingPluginsConfigMapName,
+			"name":      PayloadProcessingPluginsConfigMapForTenant("transition"),
 			"namespace": "maas-system",
 			"annotations": map[string]any{
 				"opendatahub.io/managed": "false",

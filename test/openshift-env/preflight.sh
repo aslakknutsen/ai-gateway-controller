@@ -70,7 +70,10 @@ OPENSHIFT_E2E_TENANT_NAMESPACE=xmp-tenant-$RUN_ID
 OPENSHIFT_E2E_BACKEND_NAMESPACE=xmp-provider-$RUN_ID
 OPENSHIFT_E2E_GATEWAY_NAMESPACE=openshift-ingress
 OPENSHIFT_E2E_GATEWAY_NAME=xmp-gateway-$RUN_ID
-OPENSHIFT_E2E_REGISTRY_ROUTE=xmp-registry-$RUN_ID
+# The default OpenShift Route host appends the ingress service name to the
+# route name. Keep that first DNS label within 63 characters even on clusters
+# with long run identifiers; the full run ID remains the ownership label.
+OPENSHIFT_E2E_REGISTRY_ROUTE=xmp-registry-${RUN_ID:0:24}
 OPENSHIFT_E2E_AITENANT_NAME=${OPENSHIFT_E2E_AITENANT_NAME:-models-as-a-service}
 EOF
 printf '%s\n' "$EVIDENCE"

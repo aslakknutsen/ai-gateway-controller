@@ -805,3 +805,33 @@ func reconcilerFixture(t *testing.T) (*Reconciler, *v1alpha1.ExternalModel) {
 	r.KnownClusters = []string{"provider-provider"}
 	return r, model
 }
+
+func TestReconcileRevalidatesPendingProviderDuringIPPHandoff(t *testing.T) {
+	r, model := reconcilerFixture(t)
+	var provider v1alpha1.ExternalProvider
+	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "tenant-a", Name: "provider"}, &provider); err != nil {
+		t.Fatal(err)
+	}
+	provider.Status.Phase = "Pending"
+	provider.Status.Conditions = []metav1.Condition{{
+		Type: conditionReady, Status: metav1.ConditionFalse, Reason: "Reconciling",
+		Message: "handoff in progress", LastTransitionTime: metav1.Now(),
+	}}
+	if err := r.Status().Update(context.Background(), &provider); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)}); err != nil {
+		t.Fatalf("reconcile with pending handoff provider = %v", err)
+	}
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(&provider), &provider); err != nil {
+		t.Fatal(err)
+	}
+	if provider.Status.Phase != resolver.PhaseReady {
+		t.Fatalf("provider phase = %q, want Ready", provider.Status.Phase)
+	}
+	var overlay corev1.ConfigMap
+	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "tenant-a", Name: "routing-overlay"}, &overlay); err != nil {
+		t.Fatalf("routing overlay = %v", err)
+	}
+}

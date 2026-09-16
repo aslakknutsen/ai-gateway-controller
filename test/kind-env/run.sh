@@ -457,6 +457,7 @@ EOF
     if "${KCTL[@]}" -n maas-system get deployment "$deployment_name" >/dev/null 2>&1; then
       "${KCTL[@]}" -n maas-system set env deployment/"$deployment_name" \
         NAMESPACE="$tenant_namespace" \
+        TENANT_NAMESPACE="$tenant_namespace" \
         GATEWAY_NAMESPACE=maas-system \
         GATEWAY_NAME="$gateway_name" \
         DISABLE_EXTERNAL_MODEL_CONTROLLER=true
@@ -464,6 +465,7 @@ EOF
     if "${KCTL[@]}" -n maas-system get deployment "$pre_deployment_name" >/dev/null 2>&1; then
       "${KCTL[@]}" -n maas-system set env deployment/"$pre_deployment_name" \
         NAMESPACE="$tenant_namespace" \
+        TENANT_NAMESPACE="$tenant_namespace" \
         GATEWAY_NAMESPACE=maas-system \
         GATEWAY_NAME="$gateway_name" \
         DISABLE_EXTERNAL_MODEL_CONTROLLER=true
@@ -478,7 +480,9 @@ EOF
       "serviceaccount/$deployment_name" "envoyfilter/$deployment_name" \
       "networkpolicy/$deployment_name" "destinationrule/$deployment_name" \
       "destinationrule/$pre_deployment_name" \
-      "clusterrolebinding/payload-processing-reader${tenant_id:+-$tenant_id}"; do
+      "clusterrolebinding/payload-processing-reader${tenant_id:+-$tenant_id}" \
+      "clusterrole/payload-processing-ipp-reader${tenant_id:+-$tenant_id}" \
+      "clusterrolebinding/payload-processing-ipp-reader${tenant_id:+-$tenant_id}"; do
       "${KCTL[@]}" -n maas-system delete "$resource" --ignore-not-found --wait=true >/dev/null
     done
     if "${KCTL[@]}" -n maas-system get deployment "$deployment_name" -o json 2>/dev/null \
@@ -546,24 +550,24 @@ EOF
   [[ "$ipp_ready" == true ]] || { fail "MaaS did not create the transition tenant IPP deployment"; exit 2; }
   if "${KCTL[@]}" -n maas-system get deployment/payload-processing >/dev/null 2>&1; then
     "${KCTL[@]}" -n maas-system set env deployment/payload-processing \
-      NAMESPACE=models-as-a-service GATEWAY_NAMESPACE=maas-system GATEWAY_NAME=maas-default-gateway DISABLE_EXTERNAL_MODEL_CONTROLLER=true
+      NAMESPACE=models-as-a-service TENANT_NAMESPACE=models-as-a-service GATEWAY_NAMESPACE=maas-system GATEWAY_NAME=maas-default-gateway DISABLE_EXTERNAL_MODEL_CONTROLLER=true
   fi
   if "${KCTL[@]}" -n maas-system get deployment/payload-processing-tenant-b >/dev/null 2>&1; then
     "${KCTL[@]}" -n maas-system set env deployment/payload-processing-tenant-b \
-      NAMESPACE=ai-tenant-tenant-b GATEWAY_NAMESPACE=maas-system GATEWAY_NAME=maas-tenant-b-gateway DISABLE_EXTERNAL_MODEL_CONTROLLER=true
+      NAMESPACE=ai-tenant-tenant-b TENANT_NAMESPACE=ai-tenant-tenant-b GATEWAY_NAMESPACE=maas-system GATEWAY_NAME=maas-tenant-b-gateway DISABLE_EXTERNAL_MODEL_CONTROLLER=true
   fi
   "${KCTL[@]}" -n maas-system set env deployment/payload-processing-transition \
-    NAMESPACE=ai-tenant-transition GATEWAY_NAMESPACE=maas-system GATEWAY_NAME=maas-transition-gateway DISABLE_EXTERNAL_MODEL_CONTROLLER=false
+    NAMESPACE=ai-tenant-transition TENANT_NAMESPACE=ai-tenant-transition GATEWAY_NAMESPACE=maas-system GATEWAY_NAME=maas-transition-gateway DISABLE_EXTERNAL_MODEL_CONTROLLER=false
   if "${KCTL[@]}" -n maas-system get deployment/payload-pre-processing >/dev/null 2>&1; then
     "${KCTL[@]}" -n maas-system set env deployment/payload-pre-processing \
-      NAMESPACE=models-as-a-service GATEWAY_NAMESPACE=maas-system GATEWAY_NAME=maas-default-gateway DISABLE_EXTERNAL_MODEL_CONTROLLER=true
+      NAMESPACE=models-as-a-service TENANT_NAMESPACE=models-as-a-service GATEWAY_NAMESPACE=maas-system GATEWAY_NAME=maas-default-gateway DISABLE_EXTERNAL_MODEL_CONTROLLER=true
   fi
   if "${KCTL[@]}" -n maas-system get deployment/payload-pre-processing-tenant-b >/dev/null 2>&1; then
     "${KCTL[@]}" -n maas-system set env deployment/payload-pre-processing-tenant-b \
-      NAMESPACE=ai-tenant-tenant-b GATEWAY_NAMESPACE=maas-system GATEWAY_NAME=maas-tenant-b-gateway DISABLE_EXTERNAL_MODEL_CONTROLLER=true
+      NAMESPACE=ai-tenant-tenant-b TENANT_NAMESPACE=ai-tenant-tenant-b GATEWAY_NAMESPACE=maas-system GATEWAY_NAME=maas-tenant-b-gateway DISABLE_EXTERNAL_MODEL_CONTROLLER=true
   fi
   "${KCTL[@]}" -n maas-system set env deployment/payload-pre-processing-transition \
-    NAMESPACE=ai-tenant-transition GATEWAY_NAMESPACE=maas-system GATEWAY_NAME=maas-transition-gateway DISABLE_EXTERNAL_MODEL_CONTROLLER=false
+    NAMESPACE=ai-tenant-transition TENANT_NAMESPACE=ai-tenant-transition GATEWAY_NAMESPACE=maas-system GATEWAY_NAME=maas-transition-gateway DISABLE_EXTERNAL_MODEL_CONTROLLER=false
   if "${KCTL[@]}" -n maas-system get deployment/payload-processing >/dev/null 2>&1; then "${KCTL[@]}" -n maas-system rollout status deployment/payload-processing --timeout=120s; fi
   if "${KCTL[@]}" -n maas-system get deployment/payload-processing-tenant-b >/dev/null 2>&1; then "${KCTL[@]}" -n maas-system rollout status deployment/payload-processing-tenant-b --timeout=120s; fi
   "${KCTL[@]}" -n maas-system rollout status deployment/payload-processing-transition --timeout=120s
@@ -626,7 +630,7 @@ EOF
   # it does not remove or rewrite the IPP-owned HTTPRoute.
   for ipp_deployment in payload-processing-transition payload-pre-processing-transition; do
     "${KCTL[@]}" -n maas-system set env deployment/"$ipp_deployment" \
-      NAMESPACE=ai-tenant-transition GATEWAY_NAMESPACE=maas-system GATEWAY_NAME=maas-transition-gateway DISABLE_EXTERNAL_MODEL_CONTROLLER=false
+      NAMESPACE=ai-tenant-transition TENANT_NAMESPACE=ai-tenant-transition GATEWAY_NAMESPACE=maas-system GATEWAY_NAME=maas-transition-gateway DISABLE_EXTERNAL_MODEL_CONTROLLER=false
     "${KCTL[@]}" -n maas-system rollout status deployment/"$ipp_deployment" --timeout=120s
   done
   "${KCTL[@]}" -n maas-system patch gateway maas-transition-gateway --subresource=status --type=merge -p='{"status":{"addresses":[{"type":"Hostname","value":"maas-transition-gateway.maas-system.svc.cluster.local"}]}}'
@@ -722,9 +726,14 @@ EOF
   # not route deletion or fabricated status.
   for ipp_deployment in payload-processing-transition payload-pre-processing-transition; do
     "${KCTL[@]}" -n maas-system set env deployment/"$ipp_deployment" \
-      NAMESPACE=ai-tenant-transition GATEWAY_NAMESPACE=maas-system GATEWAY_NAME=maas-transition-gateway DISABLE_EXTERNAL_MODEL_CONTROLLER=false
+      NAMESPACE=ai-tenant-transition TENANT_NAMESPACE=ai-tenant-transition GATEWAY_NAMESPACE=maas-system GATEWAY_NAME=maas-transition-gateway DISABLE_EXTERNAL_MODEL_CONTROLLER=false
     "${KCTL[@]}" -n maas-system rollout status deployment/"$ipp_deployment" --timeout=180s
   done
+  # The initial transition fixture may have been applied before the final
+  # writer/Gateway rollout. Re-apply the run-owned CRs at this settled point
+  # so the real IPP controller receives an event under the final environment;
+  # the generated HTTPRoute is never patched by the harness.
+  "${KCTL[@]}" apply -f "$ROOT/test/kind-env/manifests/42-transition-fixtures.yaml" >/dev/null
   transition_route_configured=false
   for _ in $(seq 1 60); do
     transition_parent=$("${KCTL[@]}" -n ai-tenant-transition get httproute transition-model -o jsonpath='{.spec.parentRefs[0].namespace}/{.spec.parentRefs[0].name}' 2>/dev/null || true)

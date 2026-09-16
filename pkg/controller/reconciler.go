@@ -160,10 +160,11 @@ func (r *Reconciler) modelsReferencingProviders(ctx context.Context, namespace s
 	return requests
 }
 
-// providerInputs validates providers and applies the persisted readiness gate.
-// An empty phase is the bootstrap state. Failed is revalidated on every
-// dependent event so a recovered Secret or transient transport can restore a
-// provider without a manual status edit; other phases remain gated.
+// providerInputs validates providers before building the route set. The
+// persisted phase is informational and may have been written by the
+// handoff-side IPP controller; the Secret and transport reconciliation below
+// are the authoritative gates for Praxis. Invalid providers remain excluded
+// and fail closed.
 func (r *Reconciler) providerInputs(ctx context.Context, namespace string) (
 	v1alpha1.ExternalProviderList, []*v1alpha1.ExternalProvider,
 	[]*v1alpha1.ExternalProvider, error,
@@ -182,11 +183,8 @@ func (r *Reconciler) providerInputs(ctx context.Context, namespace string) (
 			}
 			continue
 		}
-		if p.Status.Phase != "" && p.Status.Phase != resolver.PhaseReady && p.Status.Phase != "Failed" {
-			continue
-		}
 		ready := p.DeepCopy()
-		if ready.Status.Phase == "" || ready.Status.Phase == "Failed" {
+		if ready.Status.Phase != resolver.PhaseReady {
 			ready.Status.Phase = resolver.PhaseReady
 		}
 		providerPtrs = append(providerPtrs, ready)

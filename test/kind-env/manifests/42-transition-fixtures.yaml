@@ -33,6 +33,75 @@ metadata:
     app.kubernetes.io/managed-by: local-env
     maas.opendatahub.io/tenant-namespace: ai-tenant-transition
 ---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: payload-processing-ipp-reader-transition
+  labels:
+    app.kubernetes.io/managed-by: local-env
+    maas.opendatahub.io/tenant-namespace: ai-tenant-transition
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - secrets
+  verbs: [get, list, watch]
+- apiGroups:
+  - inference.opendatahub.io
+  resources:
+  - externalproviders
+  - externalmodels
+  verbs: [get, list, watch, create, update]
+- apiGroups:
+  - maas.opendatahub.io
+  resources:
+  - externalmodels
+  verbs: [get, list, watch]
+- apiGroups:
+  - inference.opendatahub.io
+  resources:
+  - externalproviders/status
+  - externalmodels/status
+  verbs: [get, update, patch]
+- apiGroups:
+  - inference.opendatahub.io
+  resources:
+  - externalproviders/finalizers
+  - externalmodels/finalizers
+  verbs: [update]
+- apiGroups:
+  - ""
+  resources:
+  - services
+  verbs: [get, list, watch, create, update, delete]
+- apiGroups:
+  - gateway.networking.k8s.io
+  resources:
+  - httproutes
+  verbs: [get, list, watch, create, update, delete]
+- apiGroups:
+  - networking.istio.io
+  resources:
+  - serviceentries
+  - destinationrules
+  verbs: [get, list, watch, create, update, delete]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: payload-processing-ipp-reader-transition
+  labels:
+    app.kubernetes.io/managed-by: local-env
+    maas.opendatahub.io/tenant-namespace: ai-tenant-transition
+subjects:
+- kind: ServiceAccount
+  name: payload-processing-transition
+  namespace: maas-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: payload-processing-ipp-reader-transition
+---
 apiVersion: v1
 kind: Secret
 metadata:
@@ -67,7 +136,7 @@ metadata:
   labels:
     inference.llm-d.ai/ipp-managed: "true"
 spec:
-  modelName: transition
+  modelName: transition-model
   externalProviderRefs:
     - ref:
         name: transition-provider

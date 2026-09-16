@@ -8,7 +8,7 @@
 # backends serve the tenant-local Praxis instances through maas-system.
 #
 # Qualification role: Supplies independently addressable provider endpoints,
-# including the HTTPS-shaped transition compatibility Service, for routing,
+# including the HTTPS transition compatibility Service, for routing,
 # attribution, and IPP-to-Praxis transition/rollback checks. Credentials here
 # are dummy test values and must never be treated as production secrets.
 
@@ -47,10 +47,9 @@ spec:
   selector: {app: katan-a}
   ports: [{name: http, port: 8000, targetPort: http}, {name: https, port: 443, targetPort: http}]
 ---
-# The existing IPP ExternalModel reconciler exposes external providers through
-# an HTTPS-shaped Service port (443), even when this local backend speaks plain
-# HTTP. Keep this compatibility endpoint run-owned and separate from the
-# production-shaped Praxis endpoint above.
+# The existing IPP ExternalModel reconciler always renders HTTPS for its
+# external-provider transport. Keep this TLS endpoint run-owned and separate
+# from the explicitly plaintext Praxis endpoints above.
 apiVersion: v1
 kind: Service
 metadata:

@@ -123,7 +123,7 @@ if [[ "$RESET" == true ]]; then
       gateway_name=maas-default-gateway
       [[ "$ipp_deployment" == *-tenant-b ]] && { tenant_namespace=ai-tenant-tenant-b; gateway_name=maas-tenant-b-gateway; }
       mutate -n maas-system set env deployment/"$ipp_deployment" \
-        NAMESPACE="$tenant_namespace" GATEWAY_NAMESPACE=maas-system GATEWAY_NAME="$gateway_name" \
+        NAMESPACE="$tenant_namespace" TENANT_NAMESPACE="$tenant_namespace" GATEWAY_NAMESPACE=maas-system GATEWAY_NAME="$gateway_name" \
         DISABLE_EXTERNAL_MODEL_CONTROLLER=true >/dev/null
       mutate -n maas-system rollout status deployment/"$ipp_deployment" --timeout=120s >/dev/null
     fi

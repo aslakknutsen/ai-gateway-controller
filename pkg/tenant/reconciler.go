@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -410,7 +411,7 @@ func (r *Reconciler) waitForForeignOwnership(ctx context.Context, resources []un
 		// a tenant to Praxis. That marker is the explicit ownership boundary:
 		// allow the Praxis controller to publish its complete config and claim
 		// the object, while all other unlabeled/foreign objects remain blocked.
-		if desired.GetKind() == "ConfigMap" && desired.GetName() == PayloadProcessingPluginsConfigMapName && current.GetAnnotations()["opendatahub.io/managed"] == "false" {
+		if isReleasedPluginConfigMap(desired) && current.GetAnnotations()["opendatahub.io/managed"] == "false" {
 			continue
 		}
 		if current.GetLabels()[managedByLabel] != render.FieldOwner {
@@ -418,6 +419,11 @@ func (r *Reconciler) waitForForeignOwnership(ctx context.Context, resources []un
 		}
 	}
 	return nil
+}
+
+func isReleasedPluginConfigMap(obj *unstructured.Unstructured) bool {
+	name := obj.GetName()
+	return name == PayloadProcessingPluginsConfigMapName || strings.HasPrefix(name, PayloadProcessingPluginsConfigMapName+"-")
 }
 
 // reconcileNotPraxis handles a tenant that currently does not opt into

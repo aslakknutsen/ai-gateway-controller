@@ -620,14 +620,19 @@ if "${OC[@]}" get deployment -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -l app=praxis 
   PROVIDER_CA_BUNDLE=$(mktemp "$STATE/.provider-ca-bundle.XXXXXX")
   PROVIDER_CA_SERVICE=$(mktemp "$STATE/.provider-service-ca.XXXXXX")
   praxis_pod=""
-  for _ in $(seq 1 60); do
+  PROVIDER_CA_COLLECTION_LOG="$OUT/provider-ca-collection.log"
+  : >"$PROVIDER_CA_COLLECTION_LOG"
+  provider_ca_ready=false
+  for _ in $(seq 1 120); do
     praxis_pod=$("${OC[@]}" get pod -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -l app=praxis -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
-    [[ -n "$praxis_pod" ]] && break
+    if [[ -n "$praxis_pod" ]] && "${OC[@]}" exec "$praxis_pod" -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -- \
+      sh -c 'cat /etc/ssl/certs/ca-certificates.crt' >"$PROVIDER_CA_BUNDLE" 2>>"$PROVIDER_CA_COLLECTION_LOG" && [[ -s "$PROVIDER_CA_BUNDLE" ]]; then
+      provider_ca_ready=true
+      break
+    fi
     sleep 2
   done
-  [[ -n "$praxis_pod" ]] || { echo "Praxis pod was not available to collect the base CA bundle" >&2; exit 1; }
-  "${OC[@]}" exec "$praxis_pod" -n "$OPENSHIFT_E2E_TENANT_NAMESPACE" -- \
-    sh -c 'cat /etc/ssl/certs/ca-certificates.crt' >"$PROVIDER_CA_BUNDLE"
+  [[ "$provider_ca_ready" == true ]] || { echo "Praxis container was not ready to collect the base CA bundle; diagnostics: $PROVIDER_CA_COLLECTION_LOG" >&2; exit 1; }
   "${OC[@]}" get configmap openshift-service-ca.crt -n "$OPENSHIFT_E2E_BACKEND_NAMESPACE" \
     -o jsonpath='{.data.service-ca\.crt}' >"$PROVIDER_CA_SERVICE"
   cat "$PROVIDER_CA_SERVICE" >>"$PROVIDER_CA_BUNDLE"

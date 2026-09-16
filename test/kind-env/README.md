@@ -18,6 +18,36 @@ controller reads this annotation but does not write the AITenant or claim
 MaaS-owned IPP resources. A typed AITenant selector would require a separate
 approved API proposal.
 
+### IPP-to-Praxis cutover test
+
+The architecture documents describe a per-tenant IPP-to-Praxis cutover, but
+explicitly reject automatic object or namespace migration:
+
+- Existing ExternalModel and ExternalProvider objects must keep working with
+  no automatic migration and no mutation.
+- Tenants opt into Praxis individually through the MaaS annotation.
+- IPP and Praxis must not both actively own routing for the same tenant.
+- The documented cutover order is effectively: stop or disable IPP, then
+  enable the new controller/Praxis path.
+- Existing tenant namespace resolution and MaaS tenancy behavior remain
+  unchanged.
+
+The separate transition test environment attempts to demonstrate that order
+for one existing tenant. `e2e.sh --suite transition` intentionally changes
+only run-owned Kind resources: it reconfigures the transition IPP processing
+Deployments, creates the transition ExternalModel and ExternalProvider, and
+switches the transition AITenant annotation to `praxis`. The controller and
+MaaS reconciliation then produce the observed route, transport, overlay, and
+Praxis workload state. The test subsequently removes the opt-in to exercise
+rollback. These operations cause test Deployment rollouts; they do not
+represent automatic migration of Kubernetes objects or movement of a tenant
+between namespaces.
+
+The transition test is separate from the ordinary routing qualification. A
+failure in its initial IPP request means the cutover sequence has not been
+proven; it must not be presented as a failure of the already-Praxis-enabled
+base path.
+
 The controller watches ExternalModel and ExternalProvider, publishes transport
 resources before the content-addressed overlay, and the local manifests
 provide two Katan backends plus standalone Praxis. Istio, Kuadrant, and the

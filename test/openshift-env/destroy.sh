@@ -6,6 +6,7 @@ STATE=${OPENSHIFT_E2E_STATE:-"$ROOT/.openshift-state"}
 source "$STATE/run.env"
 OC=(oc --kubeconfig "${OPENSHIFT_KUBECONFIG:-$STATE/kubeconfig}")
 PULL_SECRET="xmp-registry-pull-$OPENSHIFT_E2E_RUN_ID"
+GATEWAY_TLS_SECRET="xmp-gateway-tls-$OPENSHIFT_E2E_RUN_ID"
 AITENANT="${OPENSHIFT_E2E_AITENANT_NAME:-xmp-$OPENSHIFT_E2E_RUN_ID}"
 SHARED_AITENANT=false
 AITENANT_RETAINED=false
@@ -13,8 +14,13 @@ AITENANT_RETAINED=false
 # persisted AITENANT_NAME field. Never enter the deletion path for the shared
 # shared MaaS AITenant when that snapshot exists.
 if [[ "${OPENSHIFT_E2E_AITENANT_NAME:-}" == models-as-a-service || -s "$STATE/aitenant-original.json" ]]; then
-  SHARED_AITENANT=true
   AITENANT=models-as-a-service
+  # A partially completed bootstrap may have written the shared-name setting
+  # before the MaaS CRD or object existed. Treat that as an absent shared
+  # resource; require the snapshot whenever a live shared object is present.
+  if [[ -s "$STATE/aitenant-original.json" ]] || "${OC[@]}" get aitenant "$AITENANT" -n ai-tenants >/dev/null 2>&1; then
+    SHARED_AITENANT=true
+  fi
 fi
 if "${OC[@]}" get aitenant "$AITENANT" -n ai-tenants -o json >"$STATE/destroy-aitenant.json" 2>/dev/null; then
     if [[ "$SHARED_AITENANT" == true ]]; then
@@ -42,6 +48,9 @@ if "${OC[@]}" get gateway "$OPENSHIFT_E2E_GATEWAY_NAME" -n "$OPENSHIFT_E2E_GATEW
 fi
 if "${OC[@]}" get route "$OPENSHIFT_E2E_REGISTRY_ROUTE" -n openshift-image-registry -o json >"$STATE/destroy-registry-route.json" 2>/dev/null; then
   jq -e --arg run "$OPENSHIFT_E2E_RUN_ID" '.metadata.labels["external-model-praxis.opendatahub.io/run-id"] == $run' "$STATE/destroy-registry-route.json" >/dev/null || { echo "registry route ownership check failed" >&2; exit 1; }
+fi
+if "${OC[@]}" get secret "$GATEWAY_TLS_SECRET" -n "$OPENSHIFT_E2E_GATEWAY_NAMESPACE" -o json >"$STATE/destroy-gateway-tls-secret.json" 2>/dev/null; then
+  jq -e --arg run "$OPENSHIFT_E2E_RUN_ID" '.metadata.labels["external-model-praxis.opendatahub.io/run-id"] == $run and .metadata.labels["app.kubernetes.io/managed-by"] == "external-model-praxis-openshift-e2e"' "$STATE/destroy-gateway-tls-secret.json" >/dev/null || { echo "Gateway TLS Secret ownership check failed" >&2; exit 1; }
 fi
 OUT="$OPENSHIFT_E2E_EVIDENCE_ROOT/cleanup-$(date -u +%Y%m%dT%H%M%SZ)"
 mkdir -p "$OUT"
@@ -123,6 +132,10 @@ done
 if ! "${OC[@]}" delete gateway "$OPENSHIFT_E2E_GATEWAY_NAME" -n "$OPENSHIFT_E2E_GATEWAY_NAMESPACE" --ignore-not-found >/dev/null 2>&1; then
   cleanup_failed=1
   echo "Gateway cleanup failed: $OPENSHIFT_E2E_GATEWAY_NAMESPACE/$OPENSHIFT_E2E_GATEWAY_NAME" >>"$OUT/cleanup-errors.txt"
+fi
+if ! "${OC[@]}" delete secret "$GATEWAY_TLS_SECRET" -n "$OPENSHIFT_E2E_GATEWAY_NAMESPACE" --ignore-not-found >/dev/null 2>&1; then
+  cleanup_failed=1
+  echo "Gateway TLS Secret cleanup failed: $OPENSHIFT_E2E_GATEWAY_NAMESPACE/$GATEWAY_TLS_SECRET" >>"$OUT/cleanup-errors.txt"
 fi
 if ! "${OC[@]}" delete route "$OPENSHIFT_E2E_REGISTRY_ROUTE" -n openshift-image-registry --ignore-not-found >/dev/null 2>&1; then
   cleanup_failed=1

@@ -206,6 +206,76 @@ wait_provider_baseline() {
   return 1
 }
 
+wait_transition_gateway_data_plane() {
+  local route_fragment=$1 backend_fragment=$2 stable=0 gateway_pod dump clusters
+  # Gateway API status is control-plane evidence only. Require the actual
+  # transition route and backend cluster in the Gateway Envoy snapshot before
+  # sending a request; otherwise a cold xDS update can be mistaken for a
+  # routing or ownership failure.
+  for _ in $(seq 1 60); do
+    gateway_pod=$(kubectl --context "kind-$CLUSTER" -n "$API_NS" get pods \
+      -l gateway.networking.k8s.io/gateway-name=maas-transition-gateway \
+      -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+    dump=""
+    clusters=""
+    if [[ -n "$gateway_pod" ]]; then
+      dump=$(kubectl --context "kind-$CLUSTER" -n "$API_NS" exec "$gateway_pod" -c istio-proxy -- \
+        curl -fsS http://127.0.0.1:15000/config_dump 2>/dev/null || true)
+      clusters=$(kubectl --context "kind-$CLUSTER" -n "$API_NS" exec "$gateway_pod" -c istio-proxy -- \
+        curl -fsS http://127.0.0.1:15000/clusters 2>/dev/null || true)
+    fi
+    if [[ "$dump" == *"$route_fragment"* && "$dump" == *"$backend_fragment"* && \
+          "$clusters" == *"$backend_fragment"* && "$clusters" == *"health_flags::healthy"* ]]; then
+      stable=$((stable + 1))
+      [[ $stable -ge 2 ]] && return 0
+    else
+      stable=0
+    fi
+    sleep 2
+  done
+  return 1
+}
+
+wait_transition_writer_data_plane() {
+  local stable=0 processing_ready preprocessing_ready processing_endpoints preprocessing_endpoints
+  for _ in $(seq 1 60); do
+    processing_ready=$(kubectl --context "kind-$CLUSTER" -n "$API_NS" get deployment/payload-processing-transition -o json 2>/dev/null \
+      | jq -r '(.spec.replicas // 0) > 0 and (.status.readyReplicas // 0) == (.spec.replicas // 0) and (.status.updatedReplicas // 0) == (.spec.replicas // 0)' || echo false)
+    preprocessing_ready=$(kubectl --context "kind-$CLUSTER" -n "$API_NS" get deployment/payload-pre-processing-transition -o json 2>/dev/null \
+      | jq -r '(.spec.replicas // 0) > 0 and (.status.readyReplicas // 0) == (.spec.replicas // 0) and (.status.updatedReplicas // 0) == (.spec.replicas // 0)' || echo false)
+    processing_endpoints=$(kubectl --context "kind-$CLUSTER" -n "$API_NS" get endpointslice -l kubernetes.io/service-name=payload-processing-transition -o json 2>/dev/null \
+      | jq -r '[.items[].endpoints[]? | select(.conditions.ready == true)] | length' || echo 0)
+    preprocessing_endpoints=$(kubectl --context "kind-$CLUSTER" -n "$API_NS" get endpointslice -l kubernetes.io/service-name=payload-pre-processing-transition -o json 2>/dev/null \
+      | jq -r '[.items[].endpoints[]? | select(.conditions.ready == true)] | length' || echo 0)
+    if [[ "$processing_ready" == true && "$preprocessing_ready" == true && "$processing_endpoints" -gt 0 && "$preprocessing_endpoints" -gt 0 ]]; then
+      stable=$((stable + 1))
+      [[ $stable -ge 2 ]] && return 0
+    else
+      stable=0
+    fi
+    sleep 2
+  done
+  return 1
+}
+
+wait_transition_praxis_data_plane() {
+  local stable=0 deployment_ready service_endpoints
+  for _ in $(seq 1 60); do
+    deployment_ready=$(kubectl --context "kind-$CLUSTER" -n "$TNS" get deployment/"$TRANSITION_PRAXIS_NAME" -o json 2>/dev/null \
+      | jq -r '(.spec.replicas // 0) > 0 and (.status.readyReplicas // 0) == (.spec.replicas // 0) and (.status.updatedReplicas // 0) == (.spec.replicas // 0)' || echo false)
+    service_endpoints=$(kubectl --context "kind-$CLUSTER" -n "$TNS" get endpointslice -l kubernetes.io/service-name="$TRANSITION_PRAXIS_NAME" -o json 2>/dev/null \
+      | jq -r '[.items[].endpoints[]? | select(.conditions.ready == true)] | length' || echo 0)
+    if [[ "$deployment_ready" == true && "$service_endpoints" -gt 0 ]]; then
+      stable=$((stable + 1))
+      [[ $stable -ge 2 ]] && return 0
+    else
+      stable=0
+    fi
+    sleep 2
+  done
+  return 1
+}
+
 "${KCTL[@]}" cluster-info >"$EVIDENCE/cluster-info.txt" 2>&1 || exit 2
 # Keep the run-owned ExternalModel object and its UID across same-cluster
 # repeats. Recreating it changes overlay provenance even when the requested
@@ -222,24 +292,24 @@ fi
 # ExternalModel reconciler, and deleting them would hide a cutover defect.
 if "${KCTL[@]}" -n "$API_NS" get deployment/payload-processing >/dev/null 2>&1; then
   "${KCTL[@]}" -n "$API_NS" set env deployment/payload-processing \
-    NAMESPACE=models-as-a-service GATEWAY_NAMESPACE=maas-system GATEWAY_NAME=maas-default-gateway DISABLE_EXTERNAL_MODEL_CONTROLLER=true >/dev/null
+    NAMESPACE=models-as-a-service TENANT_NAMESPACE=models-as-a-service GATEWAY_NAMESPACE=maas-system GATEWAY_NAME=maas-default-gateway DISABLE_EXTERNAL_MODEL_CONTROLLER=true >/dev/null
 fi
 if "${KCTL[@]}" -n "$API_NS" get deployment/payload-processing-tenant-b >/dev/null 2>&1; then
   "${KCTL[@]}" -n "$API_NS" set env deployment/payload-processing-tenant-b \
-    NAMESPACE=ai-tenant-tenant-b GATEWAY_NAMESPACE=maas-system GATEWAY_NAME=maas-tenant-b-gateway DISABLE_EXTERNAL_MODEL_CONTROLLER=true >/dev/null
+    NAMESPACE=ai-tenant-tenant-b TENANT_NAMESPACE=ai-tenant-tenant-b GATEWAY_NAMESPACE=maas-system GATEWAY_NAME=maas-tenant-b-gateway DISABLE_EXTERNAL_MODEL_CONTROLLER=true >/dev/null
 fi
 "${KCTL[@]}" -n "$API_NS" set env deployment/payload-processing-transition \
-  NAMESPACE=ai-tenant-transition GATEWAY_NAMESPACE=maas-system GATEWAY_NAME=maas-transition-gateway DISABLE_EXTERNAL_MODEL_CONTROLLER=false >/dev/null
+  NAMESPACE=ai-tenant-transition TENANT_NAMESPACE=ai-tenant-transition GATEWAY_NAMESPACE=maas-system GATEWAY_NAME=maas-transition-gateway DISABLE_EXTERNAL_MODEL_CONTROLLER=false >/dev/null
 if "${KCTL[@]}" -n "$API_NS" get deployment/payload-pre-processing >/dev/null 2>&1; then
   "${KCTL[@]}" -n "$API_NS" set env deployment/payload-pre-processing \
-    NAMESPACE=models-as-a-service GATEWAY_NAMESPACE=maas-system GATEWAY_NAME=maas-default-gateway DISABLE_EXTERNAL_MODEL_CONTROLLER=true >/dev/null
+    NAMESPACE=models-as-a-service TENANT_NAMESPACE=models-as-a-service GATEWAY_NAMESPACE=maas-system GATEWAY_NAME=maas-default-gateway DISABLE_EXTERNAL_MODEL_CONTROLLER=true >/dev/null
 fi
 if "${KCTL[@]}" -n "$API_NS" get deployment/payload-pre-processing-tenant-b >/dev/null 2>&1; then
   "${KCTL[@]}" -n "$API_NS" set env deployment/payload-pre-processing-tenant-b \
-    NAMESPACE=ai-tenant-tenant-b GATEWAY_NAMESPACE=maas-system GATEWAY_NAME=maas-tenant-b-gateway DISABLE_EXTERNAL_MODEL_CONTROLLER=true >/dev/null
+    NAMESPACE=ai-tenant-tenant-b TENANT_NAMESPACE=ai-tenant-tenant-b GATEWAY_NAMESPACE=maas-system GATEWAY_NAME=maas-tenant-b-gateway DISABLE_EXTERNAL_MODEL_CONTROLLER=true >/dev/null
 fi
 "${KCTL[@]}" -n "$API_NS" set env deployment/payload-pre-processing-transition \
-  NAMESPACE=ai-tenant-transition GATEWAY_NAMESPACE=maas-system GATEWAY_NAME=maas-transition-gateway DISABLE_EXTERNAL_MODEL_CONTROLLER=false >/dev/null
+  NAMESPACE=ai-tenant-transition TENANT_NAMESPACE=ai-tenant-transition GATEWAY_NAMESPACE=maas-system GATEWAY_NAME=maas-transition-gateway DISABLE_EXTERNAL_MODEL_CONTROLLER=false >/dev/null
 if "${KCTL[@]}" -n "$API_NS" get deployment/payload-processing >/dev/null 2>&1; then "${KCTL[@]}" -n "$API_NS" rollout status deployment/payload-processing --timeout=120s; fi
 if "${KCTL[@]}" -n "$API_NS" get deployment/payload-processing-tenant-b >/dev/null 2>&1; then "${KCTL[@]}" -n "$API_NS" rollout status deployment/payload-processing-tenant-b --timeout=120s; fi
 "${KCTL[@]}" -n "$API_NS" rollout status deployment/payload-processing-transition --timeout=120s
@@ -786,11 +856,12 @@ fi
 
 # Separate transition tenant: absent annotation means MaaS owns the existing IPP path.
 TNS=ai-tenant-transition
+TRANSITION_PRAXIS_NAME=praxis-transition
 # The public path is derived from the ExternalModel resource name, as in the
 # IPP and controller contracts: /<namespace>/<external-model-name>/*. The
-# modelName sent in the body remains "transition".
+# modelName sent in the body remains the MaaS-resolved "transition-model".
 TRANSITION_IPP_URL="http://127.0.0.1:$TPORT/$TNS/transition-model/v1/chat/completions"
-TRANSITION_PRAXIS_URL="http://127.0.0.1:$TPORT/$TNS/transition/v1/chat/completions"
+TRANSITION_PRAXIS_URL="http://127.0.0.1:$TPORT/$TNS/transition-model/v1/chat/completions"
 transition_annotation=$(kubectl --context "kind-$CLUSTER" -n ai-tenants get aitenant transition -o jsonpath='{.metadata.annotations.maas\.opendatahub\.io/payload-processing-type}' 2>/dev/null || true)
 ipp_before=$(kubectl --context "kind-$CLUSTER" -n "$API_NS" get deployment,service,configmap,envoyfilter -o json 2>/dev/null || echo '{}')
 kubectl --context "kind-$CLUSTER" get httproute -A -o yaml >"$EVIDENCE/transition-routes-before.yaml" 2>&1 || true
@@ -810,9 +881,8 @@ for _ in $(seq 1 20); do
   sleep 1
 done
 # Transition has its own MaaS API/subscription. The main tenant key is
-# intentionally not valid for this policy, so issue a second key through the
-# transition API over verified HTTPS. Keep the key in a shell variable only;
-# never write the response or token to evidence.
+# intentionally not valid for this policy. The transition API key is minted
+# only after the route and subscription readiness gates below converge.
 TRANSITION_API_PORT=$((TPORT + 1))
 kubectl --context "kind-$CLUSTER" -n "$API_NS" port-forward svc/maas-api-transition "$TRANSITION_API_PORT:8443" >"$EVIDENCE/maas-api-transition-port-forward.log" 2>&1 &
 TAPF=$!
@@ -820,19 +890,20 @@ for _ in $(seq 1 20); do
   rg -q 'Forwarding from' "$EVIDENCE/maas-api-transition-port-forward.log" && break
   sleep 1
 done
-transition_key_response=$(timeout 15s curl --noproxy '*' --cacert "$CA_CERT" --resolve "maas-api-transition.maas-system.svc.cluster.local:$TRANSITION_API_PORT:127.0.0.1" -sS -H 'content-type: application/json' -H 'X-MaaS-Username: kind-user' -H 'X-MaaS-Group: ["system:authenticated"]' --data '{"name":"kind-transition-e2e","ephemeral":true,"subscription":"transition-subscription"}' "https://maas-api-transition.maas-system.svc.cluster.local:$TRANSITION_API_PORT/v1/api-keys")
-transition_key=$(jq -er '.key' <<<"$transition_key_response")
-unset transition_key_response
-TRANSITION_AUTH_HEADER_FILE="$EVIDENCE/.transition-auth-header"
-printf 'Authorization: Bearer %s\n' "$transition_key" >"$TRANSITION_AUTH_HEADER_FILE"
-unset transition_key
 transition_route_ready=false
+# Recreate the run-owned transition ExternalModel before observing the
+# annotation-absent route. A retained same-cluster route may still reflect an
+# earlier Gateway configuration; this sends a real ExternalModel event through
+# the IPP controller without patching its generated HTTPRoute.
+kubectl --context "kind-$CLUSTER" -n "$TNS" delete externalmodel transition-model --wait=true --ignore-not-found=true >/dev/null
+kubectl --context "kind-$CLUSTER" apply -f "$ROOT/test/kind-env/manifests/42-transition-fixtures.yaml" >/dev/null
 for _ in $(seq 1 60); do
   route_json=$("${KCTL[@]}" -n "$TNS" get httproute transition-model -o json 2>/dev/null || echo '{}')
+  route_parent=$(jq -r '.spec.parentRefs[0] | ((.namespace // "") + "/" + (.name // ""))' <<<"$route_json")
   gateway_accepted=$(jq -r '[.status.parents[]?.conditions[]? | select(.type == "Accepted" and .status == "True")] | length' <<<"$route_json")
   refs_resolved=$(jq -r '[.status.parents[]?.conditions[]? | select(.type == "ResolvedRefs" and .status == "True")] | length' <<<"$route_json")
   gateway_endpoints=$("${KCTL[@]}" -n "$API_NS" get endpoints maas-transition-gateway -o jsonpath='{.subsets[*].addresses[*].ip}' 2>/dev/null || true)
-  if [[ "$gateway_accepted" -gt 0 && "$refs_resolved" -gt 0 && -n "$gateway_endpoints" ]]; then
+  if [[ "$route_parent" == "maas-system/maas-transition-gateway" && "$gateway_accepted" -gt 0 && "$refs_resolved" -gt 0 && -n "$gateway_endpoints" ]]; then
     transition_route_ready=true
     break
   fi
@@ -842,8 +913,57 @@ if [[ "$transition_route_ready" != true ]]; then
   record 24 transition_ipp_request FAIL 000 "first_boundary=transition_route_not_ready"
   transition_ipp=000
 else
+  if ! wait_transition_writer_data_plane; then
+    printf '%s\n' 'transition IPP writer Deployments or ready Endpoints were not stable before request' \
+      >>"$EVIDENCE/transition-authorization-readiness.txt"
+    transition_route_ready=false
+  elif ! wait_transition_gateway_data_plane "ai-tenant-transition.transition-model" "provider-a-legacy"; then
+    printf '%s\n' 'transition IPP route/backend was not present and healthy in Gateway Envoy before request' \
+      >>"$EVIDENCE/transition-authorization-readiness.txt"
+    transition_route_ready=false
+  fi
+  transition_subscription_ready=false
+  for _ in $(seq 1 60); do
+    transition_subscription_phase=$("${KCTL[@]}" -n "$TNS" get maassubscription transition-subscription -o jsonpath='{.status.phase}' 2>/dev/null || true)
+    transition_subscription_condition=$("${KCTL[@]}" -n "$TNS" get maassubscription transition-subscription -o jsonpath='{range .status.conditions[?(@.type=="Ready")]}{.status}{end}' 2>/dev/null || true)
+    transition_rate_limit_ready=$("${KCTL[@]}" -n "$TNS" get maassubscription transition-subscription -o json 2>/dev/null | jq -r '([.status.tokenRateLimitStatuses[]? | select(.name == "maas-trlp-transition-model" and .ready == true)] | length) > 0' || echo false)
+    if [[ "$transition_subscription_phase" == Active && "$transition_subscription_condition" == True && "$transition_rate_limit_ready" == true ]]; then
+      transition_subscription_ready=true
+      break
+    fi
+    sleep 2
+  done
+  printf 'route_ready=%s subscription_ready=%s rate_limit_ready=%s phase=%s condition=%s\n' \
+    "$transition_route_ready" "$transition_subscription_ready" \
+    "${transition_rate_limit_ready:-unknown}" "${transition_subscription_phase:-unknown}" "${transition_subscription_condition:-unknown}" \
+    >"$EVIDENCE/transition-authorization-readiness.txt"
+  if [[ "$transition_route_ready" != true || "$transition_subscription_ready" != true ]]; then
+    transition_ipp=000
+  printf '%s\n' 'transition data plane or subscription did not become Ready before the transition request' \
+      >>"$EVIDENCE/transition-authorization-readiness.txt"
+  else
+    # Keep the response and token out of evidence. A missing key is a
+    # qualification failure at the API boundary, not a shell-abort condition.
+    transition_key_response=$(timeout 15s curl --noproxy '*' --cacert "$CA_CERT" --resolve "maas-api-transition.maas-system.svc.cluster.local:$TRANSITION_API_PORT:127.0.0.1" -sS -H 'content-type: application/json' -H 'X-MaaS-Username: kind-user' -H 'X-MaaS-Group: ["system:authenticated"]' --data '{"name":"kind-transition-e2e","ephemeral":true,"subscription":"transition-subscription"}' "https://maas-api-transition.maas-system.svc.cluster.local:$TRANSITION_API_PORT/v1/api-keys" || true)
+    transition_key=$(jq -er '.key' <<<"$transition_key_response" 2>/dev/null || true)
+    unset transition_key_response
+    if [[ -n "$transition_key" ]]; then
+      TRANSITION_AUTH_HEADER_FILE="$EVIDENCE/.transition-auth-header"
+      printf 'Authorization: Bearer %s\n' "$transition_key" >"$TRANSITION_AUTH_HEADER_FILE"
+      unset transition_key
+      transition_key_ready=true
+    else
+      transition_key_ready=false
+      printf '%s\n' 'transition API did not return an ephemeral key' \
+        >>"$EVIDENCE/transition-authorization-readiness.txt"
+    fi
+    if [[ "$transition_key_ready" == true ]]; then
 REQUEST_AUTH_HEADER_FILE="$TRANSITION_AUTH_HEADER_FILE"
 transition_ipp=$(request transition-ipp "$TRANSITION_IPP_URL" -H 'content-type: application/json' --data '{"model":"transition-model","messages":[{"role":"user","content":"existing-ipp"}]}' )
+    else
+      transition_ipp=000
+    fi
+  fi
 fi
 if [[ "$transition_ipp" == 200 ]] && rg -q 'katan-transition' "$EVIDENCE/request-transition-ipp.body"; then
   record 24 transition_ipp_request PASS "$transition_ipp" "path=ipp backend=transition"
@@ -853,28 +973,92 @@ fi
 
 "${KCTL[@]}" -n ai-tenants annotate aitenant transition maas.opendatahub.io/payload-processing-type=praxis --overwrite >/dev/null
 kubectl --context "kind-$CLUSTER" get httproute -A -o yaml >"$EVIDENCE/transition-routes-after-annotation.yaml" 2>&1 || true
+# The controller intentionally leaves the production Praxis pod identity
+# unpinned for OpenShift restricted SCC. Kind cannot verify the image's named
+# non-root user, so apply the same run-owned numeric identity patch used for
+# the base Kind workloads before evaluating transition readiness.
+for _ in $(seq 1 60); do
+  if "${KCTL[@]}" -n "$TNS" get deployment/"$TRANSITION_PRAXIS_NAME" >/dev/null 2>&1; then
+    "${KCTL[@]}" -n "$TNS" patch deployment "$TRANSITION_PRAXIS_NAME" --type=merge \
+      -p='{"spec":{"template":{"spec":{"securityContext":{"runAsUser":65532,"runAsGroup":65532,"fsGroup":65532}}}}}' >/dev/null
+    break
+  fi
+  sleep 2
+done
 cutover_ready=false
 for _ in $(seq 1 60); do
   overlay_exists=$(kubectl --context "kind-$CLUSTER" -n "$TNS" get configmap routing-overlay >/dev/null 2>&1; echo $?)
-  route_exists=$(kubectl --context "kind-$CLUSTER" -n "$TNS" get httproute/external-model-transition-model >/dev/null 2>&1; echo $?)
-  [[ "$overlay_exists" == 0 && "$route_exists" == 0 ]] && { cutover_ready=true; break; }
+  route_json=$(kubectl --context "kind-$CLUSTER" -n "$TNS" get httproute/external-model-transition-model -o json 2>/dev/null || echo '{}')
+  route_exists=$([[ "$route_json" != '{}' ]] && echo 0 || echo 1)
+  praxis_route_accepted=$(jq -r '[.status.parents[]?.conditions[]? | select(.type == "Accepted" and .status == "True")] | length' <<<"$route_json")
+  praxis_route_resolved=$(jq -r '[.status.parents[]?.conditions[]? | select(.type == "ResolvedRefs" and .status == "True")] | length' <<<"$route_json")
+  praxis_deployment_ready=$(kubectl --context "kind-$CLUSTER" -n "$TNS" get deployment/"$TRANSITION_PRAXIS_NAME" -o json 2>/dev/null | jq -r '(.spec.replicas // 0) > 0 and (.status.readyReplicas // 0) == (.spec.replicas // 0) and (.status.updatedReplicas // 0) == (.spec.replicas // 0)' || echo false)
+  praxis_service_exists=$(kubectl --context "kind-$CLUSTER" -n "$TNS" get service/"$TRANSITION_PRAXIS_NAME" >/dev/null 2>&1; echo $?)
+  transition_rate_limit_ready=$(kubectl --context "kind-$CLUSTER" -n "$TNS" get maassubscription transition-subscription -o json 2>/dev/null | jq -r '([.status.tokenRateLimitStatuses[]? | select(.name == "maas-trlp-transition-model" and .ready == true)] | length) > 0' || echo false)
+  ipp_writer_exists=false
+  for ipp_deployment in payload-processing-transition payload-pre-processing-transition; do
+    ipp_managed_by=$(kubectl --context "kind-$CLUSTER" -n "$API_NS" get deployment "$ipp_deployment" -o jsonpath='{.metadata.labels.app\.kubernetes\.io/managed-by}' 2>/dev/null || true)
+    if [[ -n "$ipp_managed_by" && "$ipp_managed_by" != "ai-gateway-controller" ]]; then
+      ipp_writer_exists=true
+      break
+    fi
+  done
+  ipp_route_exists=$(kubectl --context "kind-$CLUSTER" -n "$TNS" get httproute/transition-model >/dev/null 2>&1; echo $?)
+  [[ "$overlay_exists" == 0 && "$route_exists" == 0 && "$praxis_route_accepted" -gt 0 && "$praxis_route_resolved" -gt 0 && "$praxis_deployment_ready" == true && "$praxis_service_exists" == 0 && "$transition_rate_limit_ready" == true && "$ipp_writer_exists" == false && "$ipp_route_exists" != 0 ]] && { cutover_ready=true; break; }
   sleep 2
 done
-ipp_after_cutover=$(kubectl --context "kind-$CLUSTER" -n "$API_NS" get deployment,service,configmap,envoyfilter -o json 2>/dev/null || echo '{}')
+ipp_rbac_removed=false
+if [[ "$cutover_ready" == true && "$ipp_writer_exists" == false ]]; then
+  # The transition-only IPP RBAC is separate from the controller's reader
+  # binding. Remove it only after the IPP writer has disappeared, so the
+  # annotation switch cannot leave a disabled writer with extra permissions.
+  "${KCTL[@]}" delete clusterrolebinding/payload-processing-ipp-reader-transition --ignore-not-found=true --wait=true >/dev/null
+  "${KCTL[@]}" delete clusterrole/payload-processing-ipp-reader-transition --ignore-not-found=true --wait=true >/dev/null
+  if ! "${KCTL[@]}" get clusterrolebinding/payload-processing-ipp-reader-transition >/dev/null 2>&1 && \
+    ! "${KCTL[@]}" get clusterrole/payload-processing-ipp-reader-transition >/dev/null 2>&1; then
+    ipp_rbac_removed=true
+  fi
+fi
+printf 'overlay=%s route=%s accepted=%s resolved_refs=%s service=%s deployment_ready=%s rate_limit_ready=%s ipp_writer=%s %s ipp_route=%s\n' \
+  "$([[ "$overlay_exists" == 0 ]] && echo true || echo false)" \
+  "$([[ "$route_exists" == 0 ]] && echo true || echo false)" \
+  "$praxis_route_accepted" "$praxis_route_resolved" \
+  "$([[ "$praxis_service_exists" == 0 ]] && echo true || echo false)" \
+  "$praxis_deployment_ready" "$transition_rate_limit_ready" \
+  "$ipp_writer_exists" "ipp_rbac_removed=$ipp_rbac_removed" \
+  "$([[ "$ipp_route_exists" == 0 ]] && echo true || echo false)" \
+  >"$EVIDENCE/transition-cutover-readiness.txt"
+ipp_after_cutover_count=0
+for ipp_deployment in payload-processing-transition payload-pre-processing-transition; do
+  ipp_managed_by=$(kubectl --context "kind-$CLUSTER" -n "$API_NS" get deployment "$ipp_deployment" -o jsonpath='{.metadata.labels.app\.kubernetes\.io/managed-by}' 2>/dev/null || true)
+  if [[ -n "$ipp_managed_by" && "$ipp_managed_by" != "ai-gateway-controller" ]]; then
+    ipp_after_cutover_count=$((ipp_after_cutover_count + 1))
+  fi
+done
 stale_ipp_route_after_cutover=$(kubectl --context "kind-$CLUSTER" -n "$TNS" get httproute transition-model -o json 2>/dev/null || echo '{}')
 stale_ipp_route_owner=$(jq -r '.metadata.labels["app.kubernetes.io/managed-by"] // "absent"' <<<"$stale_ipp_route_after_cutover")
-if [[ "$cutover_ready" == true && "$ipp_after_cutover" != *"payload-processing-transition"* && "$stale_ipp_route_owner" == "absent" ]]; then
+if [[ "$cutover_ready" == true && "$ipp_after_cutover_count" == 0 && "$ipp_rbac_removed" == true && "$stale_ipp_route_owner" == "absent" ]]; then
   record 25 transition_cutover_ownership PASS null "existing_ipp_resources_removed=true praxis_resources=tenant-scoped"
 else
-  record 25 transition_cutover_ownership FAIL null "cutover_ready=$cutover_ready existing_ipp_resources_present=$([[ "$ipp_after_cutover" == *"payload-processing-transition"* ]] && echo true || echo false) stale_ipp_route_owner=$stale_ipp_route_owner"
+  record 25 transition_cutover_ownership FAIL null "cutover_ready=$cutover_ready existing_ipp_resources_present=$([[ "$ipp_after_cutover_count" != 0 ]] && echo true || echo false) ipp_rbac_removed=$ipp_rbac_removed stale_ipp_route_owner=$stale_ipp_route_owner"
 fi
-transition_praxis=$(request transition-praxis "$TRANSITION_PRAXIS_URL" -H 'content-type: application/json' --data '{"model":"transition","messages":[{"role":"user","content":"praxis"}]}' )
+if [[ "$cutover_ready" == true ]]; then
+  if ! wait_transition_praxis_data_plane || ! wait_transition_gateway_data_plane "external-model-transition-model" "praxis-transition"; then
+    printf '%s\n' 'transition Praxis workload or Gateway route/backend was not stable before request' \
+      >>"$EVIDENCE/transition-cutover-readiness.txt"
+    cutover_ready=false
+  fi
+fi
+transition_praxis=000
+if [[ "$cutover_ready" == true ]]; then
+  transition_praxis=$(request transition-praxis "$TRANSITION_PRAXIS_URL" -H 'content-type: application/json' --data '{"model":"transition-model","messages":[{"role":"user","content":"praxis"}]}' )
+fi
 kubectl --context "kind-$CLUSTER" get httproute -A -o yaml >"$EVIDENCE/transition-routes-after-cutover.yaml" 2>&1 || true
 transition_gateway_pod=$(kubectl --context "kind-$CLUSTER" -n "$API_NS" get pods -l gateway.networking.k8s.io/gateway-name=maas-transition-gateway -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
 if [[ -n "$transition_gateway_pod" ]]; then kubectl --context "kind-$CLUSTER" -n "$API_NS" logs "$transition_gateway_pod" --all-containers --tail=200 >"$EVIDENCE/transition-gateway-logs.txt" 2>&1 || true; else : >"$EVIDENCE/transition-gateway-logs.txt"; fi
 kubectl --context "kind-$CLUSTER" -n "$API_NS" logs deployment/payload-processing-transition --all-containers --tail=200 >"$EVIDENCE/transition-ipp-processing-logs.txt" 2>&1 || true
 kubectl --context "kind-$CLUSTER" -n "$API_NS" logs deployment/payload-pre-processing-transition --all-containers --tail=200 >"$EVIDENCE/transition-ipp-preprocessing-logs.txt" 2>&1 || true
-kubectl --context "kind-$CLUSTER" -n "$TNS" logs deployment/praxis --all-containers --tail=200 >"$EVIDENCE/transition-praxis-logs.txt" 2>&1 || true
+kubectl --context "kind-$CLUSTER" -n "$TNS" logs deployment/"$TRANSITION_PRAXIS_NAME" --all-containers --tail=200 >"$EVIDENCE/transition-praxis-logs.txt" 2>&1 || true
 kubectl --context "kind-$CLUSTER" -n ai-tenants annotate aitenant transition maas.opendatahub.io/payload-processing-type- >/dev/null
 rollback_ready=false
 for _ in $(seq 1 60); do
@@ -884,10 +1068,64 @@ for _ in $(seq 1 60); do
   [[ -z "$annotation_after" && "$ipp_restored" == true && "$overlay_gone" != 0 ]] && { rollback_ready=true; break; }
   sleep 2
 done
-transition_rollback=$(request transition-rollback "$TRANSITION_IPP_URL" -H 'content-type: application/json' --data '{"model":"transition-model","messages":[{"role":"user","content":"rollback"}]}' )
+transition_rollback=000
 if [[ "$rollback_ready" == true ]]; then
+  # MaaS recreates the existing IPP writer after Praxis opt-out. Reapply the
+  # transition-scoped IPP cache and Gateway settings before evaluating the
+  # restored route; otherwise the process can recreate it against the default
+  # Gateway and a rollback request would test the wrong topology.
+  for ipp_deployment in payload-processing-transition payload-pre-processing-transition; do
+    "${KCTL[@]}" -n "$API_NS" set env deployment/"$ipp_deployment" \
+      NAMESPACE=ai-tenant-transition TENANT_NAMESPACE=ai-tenant-transition \
+      GATEWAY_NAMESPACE=maas-system GATEWAY_NAME=maas-transition-gateway \
+      DISABLE_EXTERNAL_MODEL_CONTROLLER=false >/dev/null
+    "${KCTL[@]}" -n "$API_NS" rollout status deployment/"$ipp_deployment" --timeout=120s >/dev/null
+  done
+  # Recreate the run-owned transition ExternalModel after the restored IPP
+  # writers are ready. Reapplying an unchanged object does not deliver an
+  # ExternalModel event, so an old IPP route can remain attached to the
+  # previous/default Gateway after a controller restart. Deleting and
+  # recreating the fixture lets the IPP controller rebuild its route from the
+  # configured Gateway; the generated HTTPRoute itself is never patched by the
+  # harness.
+  kubectl --context "kind-$CLUSTER" -n "$TNS" delete externalmodel transition-model --wait=true --ignore-not-found=true >/dev/null
+  kubectl --context "kind-$CLUSTER" apply -f "$ROOT/test/kind-env/manifests/42-transition-fixtures.yaml" >/dev/null
+  for ipp_deployment in payload-processing-transition payload-pre-processing-transition; do
+    "${KCTL[@]}" -n "$API_NS" set env deployment/"$ipp_deployment" \
+      NAMESPACE=ai-tenant-transition TENANT_NAMESPACE=ai-tenant-transition \
+      GATEWAY_NAMESPACE=maas-system GATEWAY_NAME=maas-transition-gateway \
+      DISABLE_EXTERNAL_MODEL_CONTROLLER=false >/dev/null
+    "${KCTL[@]}" -n "$API_NS" rollout status deployment/"$ipp_deployment" --timeout=120s >/dev/null
+  done
+  rollback_route_ready=false
+  for _ in $(seq 1 60); do
+    rollback_route_json=$("${KCTL[@]}" -n "$TNS" get httproute transition-model -o json 2>/dev/null || echo '{}')
+    rollback_parent=$(jq -r '.spec.parentRefs[0] | ((.namespace // "") + "/" + (.name // ""))' <<<"$rollback_route_json")
+    rollback_accepted=$(jq -r '[.status.parents[]?.conditions[]? | select(.type == "Accepted" and .status == "True")] | length' <<<"$rollback_route_json")
+    rollback_refs=$(jq -r '[.status.parents[]?.conditions[]? | select(.type == "ResolvedRefs" and .status == "True")] | length' <<<"$rollback_route_json")
+    if [[ "$rollback_parent" == "maas-system/maas-transition-gateway" && "$rollback_accepted" -gt 0 && "$rollback_refs" -gt 0 ]]; then
+      rollback_route_ready=true
+      break
+    fi
+    sleep 2
+  done
+  if [[ "$rollback_route_ready" == true ]]; then
+    if wait_transition_writer_data_plane && wait_transition_gateway_data_plane "ai-tenant-transition.transition-model" "provider-a-legacy"; then
+      transition_rollback=$(request transition-rollback "$TRANSITION_IPP_URL" -H 'content-type: application/json' --data '{"model":"transition-model","messages":[{"role":"user","content":"rollback"}]}' )
+    else
+      printf '%s\n' 'restored IPP writer or Gateway route/backend was not stable before rollback request' \
+        >>"$EVIDENCE/transition-rollback-route.txt"
+    fi
+  fi
+  printf 'rollback_route_ready=%s parent=%s accepted=%s resolved_refs=%s\n' \
+    "$rollback_route_ready" "${rollback_parent:-unknown}" "${rollback_accepted:-unknown}" "${rollback_refs:-unknown}" \
+    >"$EVIDENCE/transition-rollback-route.txt"
   if [[ "$transition_praxis" == 200 ]] && rg -q 'via: 1.1 praxis' "$EVIDENCE/request-transition-praxis.headers"; then
-    record 26 transition_praxis_and_rollback PASS "$transition_praxis" "path=praxis rollback_http=$transition_rollback praxis_cleanup=true ipp_restored=true"
+    if [[ "$rollback_route_ready" == true && "$transition_rollback" == 200 ]]; then
+      record 26 transition_praxis_and_rollback PASS "$transition_praxis" "path=praxis rollback_http=$transition_rollback praxis_cleanup=true ipp_restored=true"
+    else
+      record 26 transition_praxis_and_rollback FAIL "$transition_praxis" "path=praxis rollback_http=$transition_rollback rollback_route_ready=$rollback_route_ready"
+    fi
   else
     record 26 transition_praxis_and_rollback FAIL "$transition_praxis" "path=praxis rollback_http=$transition_rollback"
   fi

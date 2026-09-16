@@ -39,6 +39,11 @@ state-based checks:
 The current qualification is single-tenant. Multi-tenant MaaS authorization
 dispatch, credential rotation, IPP-to-Praxis transition and rollback, and
 additional provider authentication strategies require separate qualification.
+The current integration does not support migrating a tenant between
+namespaces or relocating an existing tenant. It assumes the MaaS AITenant
+remains in place and its resolved `status.tenantNamespace` remains stable;
+those operations require separate ownership-transfer and reprojection
+semantics and are not demonstrated here.
 
 ## Resource ownership
 
@@ -298,17 +303,30 @@ ambiguous rather than a valid proof. It remains a follow-up until an
 independent supported caller-authentication mechanism exists. Credential
 rotation, OAuth2, and SigV4 are also out of scope.
 
-Run the live narrative after the qualification:
+Render the narrative from the finalized qualification evidence after the
+qualification completes:
 
 ```sh
-./test/openshift-env/demo.sh
+source "$OPENSHIFT_E2E_STATE/run.env"
+LATEST_EVIDENCE=$(find "$OPENSHIFT_E2E_EVIDENCE_ROOT" -mindepth 1 -maxdepth 1 \
+  -type d -name 'e2e-*' -print | sort | tail -n 1)
+./test/openshift-env/demo.sh --non-interactive --evidence "$LATEST_EVIDENCE"
 ```
 
-For a clean capture without interactive behavior:
+To intentionally run a new qualification and render it in one command:
 
 ```sh
-./test/openshift-env/demo.sh --non-interactive > OPENSHIFT-DEMO-OUTPUT.txt
+./test/openshift-env/e2e.sh
+source "$OPENSHIFT_E2E_STATE/run.env"
+LATEST_EVIDENCE=$(find "$OPENSHIFT_E2E_EVIDENCE_ROOT" -mindepth 1 -maxdepth 1 \
+  -type d -name 'e2e-*' -print | sort | tail -n 1)
+./test/openshift-env/demo.sh --non-interactive --evidence "$LATEST_EVIDENCE" \
+  > OPENSHIFT-DEMO-OUTPUT.txt
 ```
+
+Without `--evidence`, `demo.sh` runs `e2e.sh` first. Use that mode only when
+an additional qualification run is intentional; use the finalized evidence
+mode above for a presentation or review of an existing run.
 
 To render an existing finalized run without contacting OpenShift:
 

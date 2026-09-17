@@ -229,6 +229,26 @@ failure. If a future MaaS revision removes the source generator, update the
 overlay against that source revision and record the change before provisioning;
 do not repair this with an untracked live ConfigMap.
 
+### Praxis handoff and protected gateway namespaces
+
+For a controlled handoff, keep the Praxis annotation on the existing AITenant
+and start a MaaS build that publishes
+`status.conditions[type=IPPResourcesReleased].status=True` after its
+ownership-gated IPP writers and conflicting routes are gone. The AI Gateway
+controller waits for that condition (and understands the existing cleanup
+marker published by earlier MaaS builds) before creating same-named Praxis
+payload-processing resources. Do not first restore IPP from saved YAML, add
+ownership metadata by hand, or run two routing-state writers at once.
+
+Managed OpenShift installations may reject a controller-created
+NetworkPolicy in the shared gateway namespace. The run-owned controller
+manifest therefore passes the explicit `--skip-network-policy=true` option;
+the default remains policy management. This option assumes equivalent
+platform networking is already provided and must be paired with an explicit
+connectivity check. It is not an admission bypass and the harness never
+creates a substitute policy. The long-term installation decision belongs in
+the ODH operator/deployment topology.
+
 `e2e.sh` performs the machine-readable qualification. It uses bounded probes,
 does not retry received HTTP responses, and atomically records failures,
 including the active assertion when interrupted.

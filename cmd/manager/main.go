@@ -58,6 +58,7 @@ func main() {
 		localSite             string
 		knownClusters         []string
 		plaintextClusters     []string
+		skipNetworkPolicy     bool
 	)
 
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metrics endpoint binds to.")
@@ -95,6 +96,8 @@ func main() {
 		plaintextClusters = append(plaintextClusters, value)
 		return nil
 	})
+	flag.BoolVar(&skipNetworkPolicy, "skip-network-policy", false,
+		"Omit controller-managed payload-processing NetworkPolicies when the installation supplies equivalent networking. Default false.")
 
 	opts := zap.Options{}
 	if err := applyLogDevelopment(&opts, os.Stderr); err != nil {
@@ -156,6 +159,7 @@ func main() {
 		PraxisImage:             praxisImage,
 		PraxisImagePullPolicy:   praxisImagePullPolicy,
 		PraxisPlaintextClusters: plaintextClusterSet,
+		SkipNetworkPolicy:       skipNetworkPolicy,
 		MaaSAPIRouteNameBase:    maasAPIRouteName,
 		ResyncInterval:          resyncInterval,
 		DeletionTimeout:         deletionTimeout,

@@ -14,6 +14,7 @@ export OPENSHIFT_E2E_RUN_ID=render-test-123
 export OPENSHIFT_E2E_GATEWAY_NAME=xmp-gateway
 export OPENSHIFT_E2E_GATEWAY_NAMESPACE=xmp-controller-test
 export OPENSHIFT_E2E_GATEWAY_TLS_SECRET=xmp-gateway-tls
+export OPENSHIFT_E2E_GATEWAY_CLASS=istio
 export ROLE_NAME=xmp-controller-role-render-test-123
 export CONTROLLER_IMAGE=registry.example.test/controller@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 export EXTPROC_IMAGE=registry.example.test/extproc@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb

@@ -20,6 +20,10 @@ rules:
 - apiGroups: ["maas.opendatahub.io"]
   resources: ["aitenants/finalizers"]
   verbs: ["update"]
+# Observe MaaS's handoff boundary before claiming conflicting Praxis names.
+- apiGroups: ["maas.opendatahub.io"]
+  resources: ["maastenantconfigs"]
+  verbs: ["get", "list", "watch"]
 # Resources rendered from the vendored overlay, one set per praxis tenant.
 - apiGroups: [""]
   resources: ["services", "serviceaccounts", "configmaps"]

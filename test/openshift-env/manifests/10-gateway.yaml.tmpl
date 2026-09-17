@@ -8,7 +8,7 @@ metadata:
     external-model-praxis.opendatahub.io/run-id: ${OPENSHIFT_E2E_RUN_ID}
     app.kubernetes.io/managed-by: external-model-praxis-openshift-e2e
 spec:
-  gatewayClassName: istio
+  gatewayClassName: ${OPENSHIFT_E2E_GATEWAY_CLASS}
   listeners:
   - name: https
     protocol: HTTPS

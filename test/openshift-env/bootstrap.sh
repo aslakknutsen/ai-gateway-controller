@@ -62,7 +62,25 @@ if ! "${OC[@]}" get crd gateways.gateway.networking.k8s.io >/dev/null 2>&1; then
 fi
 "${OC[@]}" get crd gatewayclasses.gateway.networking.k8s.io httproutes.gateway.networking.k8s.io -o name >"$OUT/gateway-api-crds.txt"
 
-helm upgrade --install cert-manager jetstack/cert-manager --namespace cert-manager --create-namespace --version v1.15.3 --set crds.enabled=true --kubeconfig "${OPENSHIFT_KUBECONFIG:-$STATE/kubeconfig}" --wait --timeout 300s >"$OUT/cert-manager.log" 2>&1
+cert_manager_is_healthy() {
+  local deployment
+  "${OC[@]}" get namespace cert-manager >/dev/null 2>&1 || return 1
+  for deployment in cert-manager cert-manager-cainjector cert-manager-webhook; do
+    "${OC[@]}" wait "deployment/$deployment" -n cert-manager --for=condition=Available --timeout=30s >/dev/null 2>&1 || return 1
+  done
+  "${OC[@]}" get crd certificates.cert-manager.io certificaterequests.cert-manager.io issuers.cert-manager.io clusterissuers.cert-manager.io >/dev/null 2>&1
+}
+
+if cert_manager_is_healthy; then
+  printf '%s\n' 'healthy ODH-managed cert-manager reused as shared infrastructure; Helm ownership was not modified' >"$OUT/cert-manager-shared.txt"
+else
+  if "${OC[@]}" get namespace cert-manager >/dev/null 2>&1 ||
+     "${OC[@]}" get crd certificates.cert-manager.io >/dev/null 2>&1; then
+    echo 'cert-manager is present but not healthy; refusing to adopt or reinstall shared resources' >&2
+    exit 1
+  fi
+  helm upgrade --install cert-manager jetstack/cert-manager --namespace cert-manager --create-namespace --version v1.15.3 --set crds.enabled=true --kubeconfig "${OPENSHIFT_KUBECONFIG:-$STATE/kubeconfig}" --wait --timeout 300s >"$OUT/cert-manager.log" 2>&1
+fi
 
 ISTIO_VERSION=${ISTIO_VERSION:-1.26.2}
 ISTIO_CACHE="$STATE/cache/istio-$ISTIO_VERSION"
@@ -74,10 +92,12 @@ if [[ ! -x "$ISTIO_CACHE/bin/istioctl" ]]; then
   tar -xzf "$archive" -C "$STATE/cache"
   sha256sum "$archive" >"$STATE/cache/istio-$ISTIO_VERSION.sha256"
 fi
-# The qualification owns one Istio installation. Refuse to install beside an
-# existing control plane because its webhook CA and admission configuration are
-# cluster-scoped and cannot be safely disambiguated by this harness.
+# The qualification uses one Istio control plane. Reuse a healthy ODH-managed
+# control plane when present; never adopt, relabel, or install beside it.
 EXISTING_ISTIOD=$("${OC[@]}" get deployment -A -l app=istiod -o json 2>/dev/null | jq '[.items[] | {namespace:.metadata.namespace,name:.metadata.name,runId:(.metadata.labels["external-model-praxis.opendatahub.io/run-id"] // "")}]')
+ISTIO_SERVICE_NAME=istiod
+ISTIO_ROOT_CERT_SECRET=istio-ca-secret
+ISTIO_GATEWAY_CLASS=istio
 if [[ "$(jq 'length' <<<"$EXISTING_ISTIOD")" -ne 0 ]]; then
   printf '%s\n' "$EXISTING_ISTIOD" >"$OUT/preexisting-istiod.json"
   if [[ -n "${OPENSHIFT_E2E_REPAIR_ISTIO_RUN_ID:-}" ]]; then
@@ -99,12 +119,26 @@ if [[ "$(jq 'length' <<<"$EXISTING_ISTIOD")" -ne 0 ]]; then
     "${OC[@]}" delete namespace istio-system --ignore-not-found --wait=true --timeout=5m >>"$OUT/istio-recovery-uninstall.log" 2>&1
     EXISTING_ISTIOD='[]'
   fi
-  if [[ -z "${OPENSHIFT_E2E_REPAIR_ISTIO_RUN_ID:-}" ]] && [[ ! -f "$ISTIO_READY_MARKER" ]]; then
-    if [[ "$(jq -r 'length == 1 and .[0].namespace == "istio-system" and .[0].name == "istiod"' <<<"$EXISTING_ISTIOD")" != true ]]; then
-      echo "refusing to install beside an unowned or foreign Istio control plane; see $OUT/preexisting-istiod.json" >&2
-      exit 1
+  if [[ -z "${OPENSHIFT_E2E_REPAIR_ISTIO_RUN_ID:-}" ]]; then
+    if [[ "$(jq -r 'length == 1 and .[0].namespace == "istio-system" and .[0].name == "istiod"' <<<"$EXISTING_ISTIOD")" == true ]]; then
+      printf '%s\n' 'reusing the single shared istio-system/istiod control plane' >"$OUT/istio-reused.txt"
+    else
+      ISTIO_NS=$(jq -r '.[0].namespace' <<<"$EXISTING_ISTIOD")
+      ISTIO_DEPLOYMENT=$(jq -r '.[0].name' <<<"$EXISTING_ISTIOD")
+      ISTIO_REVISION=$("${OC[@]}" get deployment "$ISTIO_DEPLOYMENT" -n "$ISTIO_NS" -o jsonpath='{.metadata.labels.istio\.io/rev}' 2>/dev/null || true)
+      [[ -n "$ISTIO_REVISION" ]] || { echo "shared Istio deployment has no revision label; diagnostics: $OUT/preexisting-istiod.json" >&2; exit 1; }
+      ISTIO_SERVICE_NAME=$("${OC[@]}" get service -n "$ISTIO_NS" -l "app=istiod,istio.io/rev=$ISTIO_REVISION" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+      [[ -n "$ISTIO_SERVICE_NAME" ]] || { echo "shared Istio Service is missing; diagnostics: $OUT/preexisting-istiod.json" >&2; exit 1; }
+      "${OC[@]}" get secret "$ISTIO_ROOT_CERT_SECRET" -n "$ISTIO_NS" >/dev/null 2>&1 || { echo "shared Istio root CA Secret is missing; diagnostics: $OUT/preexisting-istiod.json" >&2; exit 1; }
+      for gateway_class in data-science-gateway-class openshift-default; do
+        if "${OC[@]}" get gatewayclass "$gateway_class" -o json 2>/dev/null | jq -e '[.status.conditions[]? | select(.type == "Accepted" and .status == "True")] | length == 1' >/dev/null; then
+          ISTIO_GATEWAY_CLASS=$gateway_class
+          break
+        fi
+      done
+      [[ "$ISTIO_GATEWAY_CLASS" != istio ]] || { echo "shared Istio has no accepted ODH GatewayClass; diagnostics: $OUT/preexisting-istiod.json" >&2; exit 1; }
+      printf 'reusing shared ODH Istio control plane: %s/%s via GatewayClass %s\n' "$ISTIO_NS" "$ISTIO_SERVICE_NAME" "$ISTIO_GATEWAY_CLASS" >"$OUT/istio-reused.txt"
     fi
-    printf '%s\n' 'reusing the single shared istio-system/istiod control plane' >"$OUT/istio-reused.txt"
   fi
   if [[ -n "${OPENSHIFT_E2E_REPAIR_ISTIO_RUN_ID:-}" ]]; then
     ISTIO_ALREADY_INSTALLED=false
@@ -138,8 +172,8 @@ users:
 - system:serviceaccount:istio-system:istio-ingressgateway-service-account
 EOF
 "$ISTIO_CACHE/bin/istioctl" install --kubeconfig "${OPENSHIFT_KUBECONFIG:-$STATE/kubeconfig}" --set profile=minimal --set components.ingressGateways[0].name=istio-ingressgateway --set components.ingressGateways[0].enabled=true --set values.gateways.istio-ingressgateway.autoscaleEnabled=false --set values.gateways.istio-ingressgateway.replicaCount=1 -y >"$OUT/istio.log" 2>&1
-fi
 "${OC[@]}" rollout status deployment/istio-ingressgateway -n istio-system --timeout=300s
+fi
 
 # Never repair an unowned Istio webhook in place. A previous installation can
 # leave a second control plane or a webhook signed by the other control plane.
@@ -160,10 +194,10 @@ if [[ "$ISTIO_DEPLOYMENT_COUNT" -ne 1 ]]; then
 fi
 
 ISTIO_NS=$(jq -r '.[0].namespace' <<<"$ISTIO_DEPLOYMENTS")
-ISTIO_SERVICE=$("${OC[@]}" get service istiod -n "$ISTIO_NS" -o json 2>/dev/null || true)
+ISTIO_SERVICE=$("${OC[@]}" get service "$ISTIO_SERVICE_NAME" -n "$ISTIO_NS" -o json 2>/dev/null || true)
 printf '%s\n' "$ISTIO_SERVICE" >"$ISTIO_CHAIN/istiod-service.json"
-[[ -n "$ISTIO_SERVICE" ]] || { echo "Istio Service istiod is missing in $ISTIO_NS; diagnostics: $ISTIO_CHAIN" >&2; exit 1; }
-"${OC[@]}" get endpoints istiod -n "$ISTIO_NS" -o json >"$ISTIO_CHAIN/istiod-endpoints.json"
+[[ -n "$ISTIO_SERVICE" ]] || { echo "Istio Service $ISTIO_SERVICE_NAME is missing in $ISTIO_NS; diagnostics: $ISTIO_CHAIN" >&2; exit 1; }
+"${OC[@]}" get endpoints "$ISTIO_SERVICE_NAME" -n "$ISTIO_NS" -o json >"$ISTIO_CHAIN/istiod-endpoints.json"
 if ! jq -e 'any(.subsets[]?.addresses[]?; .ip != null)' "$ISTIO_CHAIN/istiod-endpoints.json" >/dev/null; then
   echo "Istio Service has no ready endpoints; diagnostics: $ISTIO_CHAIN" >&2
   exit 1
@@ -171,36 +205,48 @@ fi
 
 ROOT_CERT=$(mktemp "$STATE/.istio-root-cert.XXXXXX")
 trap 'rm -f "$ROOT_CERT"' EXIT
-if ! "${OC[@]}" get secret istio-ca-secret -n "$ISTIO_NS" -o json | jq -r '.data["root-cert.pem"]' | base64 -d >"$ROOT_CERT" || [[ ! -s "$ROOT_CERT" ]]; then
+if ! "${OC[@]}" get secret "$ISTIO_ROOT_CERT_SECRET" -n "$ISTIO_NS" -o json | jq -r '.data["root-cert.pem"]' | base64 -d >"$ROOT_CERT" || [[ ! -s "$ROOT_CERT" ]]; then
   echo "Istio root certificate is unavailable in $ISTIO_NS; diagnostics: $ISTIO_CHAIN" >&2
   exit 1
 fi
 ROOT_SHA=$(sha256sum "$ROOT_CERT" | awk '{print $1}')
 printf 'namespace=%s\nroot_cert_sha256=%s\n' "$ISTIO_NS" "$ROOT_SHA" >"$ISTIO_CHAIN/root-cert.txt"
-ISTIO_POD=$("${OC[@]}" get pod -n "$ISTIO_NS" -l app=istiod -o jsonpath='{.items[0].metadata.name}')
-# Verify the certificate actually served by istiod, using the installed root
-# certificate and the same SNI/name used by the webhook service.  Keep only
-# certificate metadata and the verification result; never write certificate
-# bytes to evidence.
-ISTIO_SERVER_NAME="istiod.$ISTIO_NS.svc"
-ISTIO_VERIFY_SCRIPT=$(cat <<EOF
-set -eu
-cat > /dev/shm/xmp-istio-root.pem
+# Verify the certificate actually served by the Istio Service, using the
+# installed root certificate and the same SNI/name used by the webhook
+# Service. Port-forwarding keeps this check independent of the control-plane
+# image contents; only the verification result is written to evidence.
+ISTIO_SERVER_NAME="$ISTIO_SERVICE_NAME.$ISTIO_NS.svc"
+command -v openssl >/dev/null || { echo 'openssl is required for Istio certificate verification' >&2; exit 1; }
+ISTIO_FORWARD_LOG=$(mktemp "$STATE/.istio-port-forward.XXXXXX")
+"${OC[@]}" port-forward -n "$ISTIO_NS" "service/$ISTIO_SERVICE_NAME" 0:443 >"$ISTIO_FORWARD_LOG" 2>&1 &
+ISTIO_FORWARD_PID=$!
+ISTIO_LOCAL_PORT=""
+for _ in {1..30}; do
+  ISTIO_LOCAL_PORT=$(sed -nE 's/.*Forwarding from 127\.0\.0\.1:([0-9]+) -> [0-9]+.*/\1/p' "$ISTIO_FORWARD_LOG" | head -1)
+  [[ -n "$ISTIO_LOCAL_PORT" ]] && break
+  sleep 1
+done
+if [[ -z "$ISTIO_LOCAL_PORT" ]]; then
+  printf '%s\n' 'port-forward did not become ready' >"$ISTIO_CHAIN/live-serving-certificate.txt"
+  printf '%s\n' "$(sed -n '1,20p' "$ISTIO_FORWARD_LOG")" >>"$ISTIO_CHAIN/live-serving-certificate.txt"
+  kill "$ISTIO_FORWARD_PID" 2>/dev/null || true
+  wait "$ISTIO_FORWARD_PID" 2>/dev/null || true
+  rm -f "$ISTIO_FORWARD_LOG"
+  exit 1
+fi
 set +e
-result=\$(openssl s_client -connect 127.0.0.1:15017 -servername "$ISTIO_SERVER_NAME" -CAfile /dev/shm/xmp-istio-root.pem -verify_return_error -brief </dev/null 2>&1)
-openssl_rc=\$?
-rm -f /dev/shm/xmp-istio-root.pem
-printf "%s\\n" "\$result"
-printf "openssl_exit=%s\\n" "\$openssl_rc"
-[ "\$openssl_rc" -eq 0 ] && printf "%s\\n" "\$result" | grep -q "Verification: OK"
-EOF
-)
-if ! LIVE_CERT_RESULT=$("${OC[@]}" exec -i -n "$ISTIO_NS" "$ISTIO_POD" -c discovery -- sh -c "$ISTIO_VERIFY_SCRIPT" <"$ROOT_CERT"); then
-  printf '%s\n' "$LIVE_CERT_RESULT" >"$ISTIO_CHAIN/live-serving-certificate.txt"
+LIVE_CERT_RESULT=$(timeout 30s openssl s_client -connect "127.0.0.1:$ISTIO_LOCAL_PORT" -servername "$ISTIO_SERVER_NAME" -CAfile "$ROOT_CERT" -verify_return_error -brief </dev/null 2>&1)
+OPENSSL_RC=$?
+set -e
+kill "$ISTIO_FORWARD_PID" 2>/dev/null || true
+wait "$ISTIO_FORWARD_PID" 2>/dev/null || true
+rm -f "$ISTIO_FORWARD_LOG"
+printf '%s\n' "$LIVE_CERT_RESULT" >"$ISTIO_CHAIN/live-serving-certificate.txt"
+printf 'openssl_exit=%s\n' "$OPENSSL_RC" >>"$ISTIO_CHAIN/live-serving-certificate.txt"
+if [[ "$OPENSSL_RC" -ne 0 ]] || ! grep -q 'Verification: OK' "$ISTIO_CHAIN/live-serving-certificate.txt"; then
   echo "Istio live serving certificate verification failed; diagnostics: $ISTIO_CHAIN" >&2
   exit 1
 fi
-printf '%s\n' "$LIVE_CERT_RESULT" >"$ISTIO_CHAIN/live-serving-certificate.txt"
 
 VALIDATION_WEBHOOK_COUNT=$(jq '[.items[] | .webhooks[]? | select((.name // "") | test("validation\\.istio\\.io"))] | length' "$ISTIO_CHAIN/webhooks.json")
 if [[ "$VALIDATION_WEBHOOK_COUNT" -eq 0 ]]; then
@@ -209,7 +255,7 @@ if [[ "$VALIDATION_WEBHOOK_COUNT" -eq 0 ]]; then
 fi
 if ! jq -r '.items[] | . as $c | .webhooks[]? | select((.name // "") | test("validation\\.istio\\.io")) | [$c.metadata.name,.name,(.clientConfig.service.name // ""),(.clientConfig.service.namespace // ""),(.clientConfig.service.path // ""),((.clientConfig.service.port // "")|tostring),(.clientConfig.caBundle // "")] | @tsv' "$ISTIO_CHAIN/webhooks.json" |
   while IFS=$'\t' read -r config name service namespace path port bundle; do
-    [[ "$namespace" == "$ISTIO_NS" && "$service" == "istiod" && "$path" == "/validate" && "$port" == 443 && -n "$bundle" ]] || { echo "invalid Istio validation webhook target: $config/$name" >&2; exit 1; }
+    [[ "$namespace" == "$ISTIO_NS" && "$service" == "$ISTIO_SERVICE_NAME" && "$path" == "/validate" && "$port" == 443 && -n "$bundle" ]] || { echo "invalid Istio validation webhook target: $config/$name" >&2; exit 1; }
     bundle_sha=$(printf '%s' "$bundle" | base64 -d | sha256sum | awk '{print $1}')
     printf '%s/%s service=%s/%s path=%s port=%s ca_sha=%s\n' "$config" "$name" "$namespace" "$service" "$path" "$port" "$bundle_sha"
     [[ "$bundle_sha" == "$ROOT_SHA" ]] || { echo "Istio webhook CA does not match $ISTIO_NS root: $config/$name" >&2; exit 1; }
@@ -238,15 +284,33 @@ fi
 # The marker is local, non-secret provenance for this harness state. Shared
 # Istio resources are intentionally not relabeled. A later idempotent
 # bootstrap may reuse this exact, already-validated control plane.
-printf 'version=%s\nnamespace=%s\nservice=istiod\n' "$ISTIO_VERSION" "$ISTIO_NS" >"$ISTIO_READY_MARKER.tmp"
+printf 'version=%s\nnamespace=%s\nservice=%s\ngateway_class=%s\n' "$ISTIO_VERSION" "$ISTIO_NS" "$ISTIO_SERVICE_NAME" "$ISTIO_GATEWAY_CLASS" >"$ISTIO_READY_MARKER.tmp"
 mv "$ISTIO_READY_MARKER.tmp" "$ISTIO_READY_MARKER"
+printf '%s\n' "$ISTIO_GATEWAY_CLASS" >"$STATE/istio-gateway-class.txt.tmp"
+mv "$STATE/istio-gateway-class.txt.tmp" "$STATE/istio-gateway-class.txt"
 
 # Istio namespace, control-plane objects, and admission webhooks are shared
 # cluster infrastructure, not run-owned resources.  Record their identity and
 # leave their ownership labels untouched; only the run-owned SCC is cleaned up.
 printf 'namespace=%s\ncontrol_plane=istiod\nownership=shared-platform-infrastructure\n' "$ISTIO_NS" >"$ISTIO_CHAIN/ownership.txt"
 
-if ! "${OC[@]}" get deployment kuadrant-operator-controller-manager -n kuadrant-system >/dev/null 2>&1; then
+KUADRANT_SHARED=false
+KUADRANT_NAME=kuadrant
+if "${OC[@]}" get deployment kuadrant-operator-controller-manager -n kuadrant-system >/dev/null 2>&1; then
+  KUADRANT_NAME=$("${OC[@]}" get kuadrant -n kuadrant-system -o json 2>/dev/null | jq -r '[.items[] | select([.status.conditions[]? | select(.type == "Ready" and .status == "True")] | length == 1) | .metadata.name] | if length == 1 then .[0] else "" end')
+  KUADRANT_OPERATOR_READY=$("${OC[@]}" get deployment kuadrant-operator-controller-manager -n kuadrant-system -o json | jq -e '.status.availableReplicas >= 1 and .status.readyReplicas >= 1' >/dev/null; echo $?)
+  AUTHORINO_OPERATOR_READY=$("${OC[@]}" get deployment authorino-operator -n kuadrant-system -o json 2>/dev/null | jq -e '.status.availableReplicas >= 1 and .status.readyReplicas >= 1' >/dev/null; echo $?)
+  LIMITADOR_OPERATOR_READY=$("${OC[@]}" get deployment limitador-operator-controller-manager -n kuadrant-system -o json 2>/dev/null | jq -e '.status.availableReplicas >= 1 and .status.readyReplicas >= 1' >/dev/null; echo $?)
+  AUTHORINO_READY=$("${OC[@]}" get authorino authorino -n kuadrant-system -o json 2>/dev/null | jq -e '[.status.conditions[]? | select(.type == "Ready" and .status == "True")] | length == 1' >/dev/null; echo $?)
+  LIMITADOR_READY=$("${OC[@]}" get limitador limitador -n kuadrant-system -o json 2>/dev/null | jq -e '[.status.conditions[]? | select(.type == "Ready" and .status == "True")] | length == 1' >/dev/null; echo $?)
+  if [[ -n "$KUADRANT_NAME" && "$KUADRANT_OPERATOR_READY" == 0 && "$AUTHORINO_OPERATOR_READY" == 0 && "$LIMITADOR_OPERATOR_READY" == 0 && "$AUTHORINO_READY" == 0 && "$LIMITADOR_READY" == 0 ]]; then
+    KUADRANT_SHARED=true
+    printf 'shared=true\nkuadrant=%s\nreason=healthy ODH-managed Kuadrant, Authorino, and Limitador reused without ownership changes\n' "$KUADRANT_NAME" >"$OUT/kuadrant-shared.txt"
+  else
+    echo 'Kuadrant resources are present but not healthy; refusing to adopt or reinstall shared operators' >&2
+    exit 1
+  fi
+else
   kustomize build "$KUADRANT_OPERATOR_REPO/config/install/openshift" | pin_kuadrant_catalog_image | normalize_kuadrant_olm | without_managed_gateway_crds | "${OC[@]}" apply -f - >"$OUT/kuadrant-install.log" 2>&1
 fi
 KUADRANT_DEADLINE=$((SECONDS + 300))
@@ -260,6 +324,12 @@ done
 # evidence: MaaS expects the v1.4.2 catalog and Authorino Operator v0.23.1.
 KUADRANT_VERSION_EVIDENCE="$OUT/kuadrant-version-evidence"
 mkdir -p "$KUADRANT_VERSION_EVIDENCE"
+if [[ "$KUADRANT_SHARED" == true ]]; then
+  "${OC[@]}" get csv -n kuadrant-system -o json >"$KUADRANT_VERSION_EVIDENCE/csv.json"
+  "${OC[@]}" get kuadrant,authorino,limitador -n kuadrant-system -o json >"$KUADRANT_VERSION_EVIDENCE/shared-resources.json"
+  printf '%s\n' 'shared ODH-managed Kuadrant stack; no CatalogSource is present and no operator resources were changed' >"$KUADRANT_VERSION_EVIDENCE/shared.txt"
+fi
+if [[ "$KUADRANT_SHARED" == false ]]; then
 CATALOG_IMAGE=$("${OC[@]}" get catalogsource kuadrant-operator-catalog -n kuadrant-system -o jsonpath='{.spec.image}' 2>/dev/null || true)
 printf 'expected=%s\nobserved=%s\n' "$KUADRANT_CATALOG_IMAGE" "$CATALOG_IMAGE" >"$KUADRANT_VERSION_EVIDENCE/catalog.txt"
 [[ "$CATALOG_IMAGE" == "$KUADRANT_CATALOG_IMAGE" ]] || { echo "Kuadrant CatalogSource is not the pinned v1.4.2 digest; diagnostics: $KUADRANT_VERSION_EVIDENCE" >&2; exit 1; }
@@ -311,13 +381,24 @@ printf 'expected_runtime_version=%s\nexpected_runtime_digest=%s\nobserved_image_
   exit 1
 }
 fi
+fi
 # The pinned Kuadrant OpenShift bundle also contains sail.yaml, which creates
 # a second Sail-managed Istio control plane. This harness owns the single
 # pinned istio-system control plane above, so apply only the three independent
 # Kuadrant configuration resources from the pinned checkout.
-for kuadrant_config in authorino.yaml limitador.yaml kuadrant.yaml; do
-  "${OC[@]}" apply -f "$KUADRANT_OPERATOR_REPO/config/install/configure/standard/$kuadrant_config"
-done >"$OUT/kuadrant-configure.log" 2>&1
+if [[ "$KUADRANT_SHARED" == false ]]; then
+  for kuadrant_config in authorino.yaml limitador.yaml kuadrant.yaml; do
+    "${OC[@]}" apply -f "$KUADRANT_OPERATOR_REPO/config/install/configure/standard/$kuadrant_config"
+  done >"$OUT/kuadrant-configure.log" 2>&1
+fi
+if [[ "$KUADRANT_SHARED" == true ]]; then
+  "${OC[@]}" get pod -n kuadrant-system -o json >"$KUADRANT_VERSION_EVIDENCE/pods.json"
+  jq '[.items[] | select(.metadata.name|test("authorino|kuadrant|limitador")) | {name:.metadata.name,images:[.status.containerStatuses[]?.image],imageIDs:[.status.containerStatuses[]?.imageID]}]' "$KUADRANT_VERSION_EVIDENCE/pods.json" >"$KUADRANT_VERSION_EVIDENCE/running-images.json"
+  if jq -e '[.[] | .images[]? | select(test(":latest$"))] | length > 0' "$KUADRANT_VERSION_EVIDENCE/running-images.json" >/dev/null; then
+    echo "shared Kuadrant operand image is floating; diagnostics: $KUADRANT_VERSION_EVIDENCE" >&2
+    exit 1
+  fi
+else
 AUTHORINO_DEADLINE=$((SECONDS + 300))
 while :; do
   AUTHORINO_POD=$("${OC[@]}" get pod -n kuadrant-system -l authorino-resource=authorino -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
@@ -349,6 +430,7 @@ printf 'expected_runtime_version=%s\nexpected_runtime_digest=%s\nobserved_image_
   echo "Authorino runtime image digest does not match the catalog-resolved digest; diagnostics: $KUADRANT_VERSION_EVIDENCE" >&2
   exit 1
 }
+fi
 # Fail closed if a broad or stale configure step created a competing Sail
 # control plane. The parent Istio resource must be absent in this topology.
 SAIL_ISTIO_JSON=$("${OC[@]}" get istio.sailoperator.io -A -o json 2>/dev/null || true)
@@ -361,8 +443,10 @@ fi
 # Authorino may become Ready just after the Kuadrant controller starts. Restart
 # the controller once, through the normal Deployment lifecycle, so its
 # dependency discovery is deterministic rather than relying on a fixed sleep.
-"${OC[@]}" rollout restart deployment/kuadrant-operator-controller-manager -n kuadrant-system >"$OUT/kuadrant-restart.log" 2>&1
-"${OC[@]}" rollout status deployment/kuadrant-operator-controller-manager -n kuadrant-system --timeout=300s >>"$OUT/kuadrant-restart.log" 2>&1
+if [[ "$KUADRANT_SHARED" == false ]]; then
+  "${OC[@]}" rollout restart deployment/kuadrant-operator-controller-manager -n kuadrant-system >"$OUT/kuadrant-restart.log" 2>&1
+  "${OC[@]}" rollout status deployment/kuadrant-operator-controller-manager -n kuadrant-system --timeout=300s >>"$OUT/kuadrant-restart.log" 2>&1
+fi
 
 # Authorino can become Ready after the Kuadrant controller has already
 # completed its initial dependency discovery.  Do not let a later request
@@ -372,7 +456,7 @@ fi
 KUADRANT_READY_EVIDENCE="$OUT/kuadrant-ready.json"
 KUADRANT_READY_DEADLINE=$((SECONDS + 300))
 while :; do
-  KUADRANT_STATUS=$("${OC[@]}" get kuadrant kuadrant -n kuadrant-system -o json 2>/dev/null || true)
+  KUADRANT_STATUS=$("${OC[@]}" get kuadrant "$KUADRANT_NAME" -n kuadrant-system -o json 2>/dev/null || true)
   if [[ -n "$KUADRANT_STATUS" ]] && jq -e '[.status.conditions[]? | select(.type == "Ready" and .status == "True")] | length == 1' <<<"$KUADRANT_STATUS" >/dev/null; then
     printf '%s\n' "$KUADRANT_STATUS" >"$KUADRANT_READY_EVIDENCE"
     break
@@ -385,7 +469,20 @@ while :; do
   sleep 3
 done
 
-kustomize build "$KSERVE_REPO/config/crd/minimal" | "${OC[@]}" apply --server-side -f - >"$OUT/kserve-crds.log" 2>&1
+KSERVE_CRD_NAMES=$(kustomize build "$KSERVE_REPO/config/crd/minimal" | yq eval-all -r 'select(.kind == "CustomResourceDefinition") | .metadata.name' - | sed '/^---$/d')
+KSERVE_MISSING=()
+for crd_name in $KSERVE_CRD_NAMES; do
+  "${OC[@]}" get crd "$crd_name" >/dev/null 2>&1 || KSERVE_MISSING+=("$crd_name")
+done
+if ((${#KSERVE_MISSING[@]} == 0)); then
+  printf 'reused complete ODH-managed KServe CRD set (%s CRDs); no server-side ownership changes\n' "$(wc -w <<<"$KSERVE_CRD_NAMES" | tr -d ' ')" >"$OUT/kserve-crds-shared.txt"
+elif ((${#KSERVE_MISSING[@]} == $(wc -w <<<"$KSERVE_CRD_NAMES" | tr -d ' '))); then
+  kustomize build "$KSERVE_REPO/config/crd/minimal" | "${OC[@]}" apply --server-side -f - >"$OUT/kserve-crds.log" 2>&1
+else
+  printf '%s\n' "${KSERVE_MISSING[@]}" >"$OUT/kserve-crds-partial.txt"
+  echo "KServe CRD set is partially present; refusing to adopt or modify shared CRDs: $OUT/kserve-crds-partial.txt" >&2
+  exit 1
+fi
 
 # The fresh CI cluster does not expose the internal registry by default. This
 # route is run-owned and is removed by destroy.sh; it is not a production

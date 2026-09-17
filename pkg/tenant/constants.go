@@ -39,6 +39,15 @@ var AITenantGVK = schema.GroupVersionKind{
 	Kind:    "AITenant",
 }
 
+// MaasTenantConfigGVK identifies MaaS's namespace-scoped tenant configuration
+// object. Its IPPResourcesReleased condition is the handoff boundary for
+// same-named Praxis payload-processing resources.
+var MaasTenantConfigGVK = schema.GroupVersionKind{
+	Group:   "maas.opendatahub.io",
+	Version: "v1alpha1",
+	Kind:    "MaasTenantConfig",
+}
+
 const (
 	// AnnotationPayloadProcessingType is MaaS's current public selector for
 	// the payload-processing backend. It is intentionally annotation-based;
@@ -61,6 +70,12 @@ const (
 	// alone is not sufficient, since AITenantReconciler populates it
 	// optimistically (from spec, unvalidated) before that work happens.
 	AITenantPhaseActive = "Active"
+
+	// MaasTenantConfigName is the singleton configuration created for each
+	// AITenant by MaaS.
+	MaasTenantConfigName = "default-tenant"
+	// IPPResourcesReleasedCondition is the explicit MaaS handoff condition.
+	IPPResourcesReleasedCondition = "IPPResourcesReleased"
 
 	// PraxisCleanupFinalizer is added to every AITenant this controller has
 	// applied praxis-extproc resources for, so it can clean them up when

@@ -73,6 +73,11 @@ type Reconciler struct {
 	// PraxisPlaintextClusters names test-only Praxis clusters that intentionally
 	// speak plaintext. All other provider clusters use verified TLS.
 	PraxisPlaintextClusters map[string]struct{}
+	// SkipNetworkPolicy omits the controller-managed payload-processing
+	// NetworkPolicy when an installation supplies equivalent networking and the
+	// target namespace disallows this controller from creating policies. It is
+	// false by default and must be set explicitly by the installer.
+	SkipNetworkPolicy bool
 	// MaaSAPIRouteNameBase is the base name used to disable ext_proc on
 	// maas-api's own HTTPRoute rules; suffixed per tenant like every other
 	// resource this package renames.
@@ -102,7 +107,14 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 		For(NewAITenant()).
 		Watches(&v1alpha1.ExternalProvider{}, handler.EnqueueRequestsFromMapFunc(r.tenantsForNamespace)).
 		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.tenantsForNamespace)).
+		Watches(maasTenantConfigObject(), handler.EnqueueRequestsFromMapFunc(r.tenantsForNamespace)).
 		Complete(r)
+}
+
+func maasTenantConfigObject() *unstructured.Unstructured {
+	config := &unstructured.Unstructured{}
+	config.SetGroupVersionKind(MaasTenantConfigGVK)
+	return config
 }
 
 // tenantsForNamespace re-renders the standalone Praxis pod template when a
@@ -182,8 +194,14 @@ func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, aiten
 	}
 
 	if !IsIPPMigrationCleanupComplete(aitenant) {
-		log.Info("waiting for maas IPP migration cleanup before applying praxis-extproc")
-		return ctrl.Result{RequeueAfter: notReadyRequeueInterval}, nil
+		released, reason, err := r.ippResourcesReleased(ctx, tenantNamespace)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if !released {
+			log.Info("AITenant is Praxis-enabled but MaaS has not released IPP resources; will retry", "reason", reason)
+			return ctrl.Result{RequeueAfter: notReadyRequeueInterval}, nil
+		}
 	}
 
 	rendered, err := render.Build(r.ManifestPath)
@@ -207,6 +225,16 @@ func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, aiten
 		log.Error(err, "cannot render praxis-extproc resources for this tenant name; will not retry until the AITenant changes")
 		return ctrl.Result{}, nil
 	}
+	if r.SkipNetworkPolicy {
+		filtered := make([]unstructured.Unstructured, 0, len(resources))
+		for _, resource := range resources {
+			if resource.GetKind() != "NetworkPolicy" {
+				filtered = append(filtered, resource)
+			}
+		}
+		resources = filtered
+		log.Info("omitting controller-managed NetworkPolicy by explicit configuration", "namespace", gatewayNamespace)
+	}
 	// The vendored ExtProc manifests intentionally carry no controller-specific
 	// ownership marker. Stamp the complete tenant render before the handoff
 	// check so resources successfully applied by this reconciler are recognized
@@ -220,62 +248,9 @@ func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, aiten
 		labels[managedByLabel] = render.FieldOwner
 		resources[i].SetLabels(labels)
 	}
-	providerList := &unstructured.UnstructuredList{}
-	providerList.SetGroupVersionKind(schema.GroupVersionKind{Group: "inference.opendatahub.io", Version: "v1alpha1", Kind: "ExternalProviderList"})
-	if err := r.Client.List(ctx, providerList, client.InNamespace(tenantNamespace)); err != nil {
-		return ctrl.Result{}, fmt.Errorf("list tenant ExternalProviders: %w", err)
-	}
-	providers := make([]v1alpha1.ExternalProvider, 0, len(providerList.Items))
-	modelList := &unstructured.UnstructuredList{}
-	modelList.SetGroupVersionKind(schema.GroupVersionKind{Group: "inference.opendatahub.io", Version: "v1alpha1", Kind: "ExternalModelList"})
-	if err := r.Client.List(ctx, modelList, client.InNamespace(tenantNamespace)); err != nil {
-		return ctrl.Result{}, fmt.Errorf("list tenant ExternalModels: %w", err)
-	}
-	referencedProviders := map[string]bool{}
-	// The static Praxis configuration includes every referenced provider so
-	// that a later weight change can reuse the same transport. The routing
-	// overlay, however, intentionally omits refs whose weight disables them.
-	// Keep the rollout gate aligned with the eligible candidate set rather than
-	// requiring disabled providers to appear in the published overlay.
-	requiredOverlayProviders := map[string]bool{}
-	for i := range modelList.Items {
-		refs, found, err := unstructured.NestedSlice(modelList.Items[i].Object, "spec", "externalProviderRefs")
-		if err != nil {
-			return ctrl.Result{}, fmt.Errorf("read provider refs for ExternalModel %s: %w", modelList.Items[i].GetName(), err)
-		}
-		if !found {
-			continue
-		}
-		for _, raw := range refs {
-			ref, ok := raw.(map[string]any)
-			if !ok {
-				return ctrl.Result{}, fmt.Errorf("invalid provider ref in ExternalModel %s", modelList.Items[i].GetName())
-			}
-			name, _, err := unstructured.NestedString(ref, "ref", "name")
-			if err != nil {
-				return ctrl.Result{}, fmt.Errorf("read provider ref in ExternalModel %s: %w", modelList.Items[i].GetName(), err)
-			}
-			if name != "" {
-				referencedProviders[name] = true
-				weight, found, err := unstructured.NestedInt64(ref, "weight")
-				if err != nil {
-					return ctrl.Result{}, fmt.Errorf("read provider weight in ExternalModel %s: %w", modelList.Items[i].GetName(), err)
-				}
-				if !found || weight > 0 {
-					requiredOverlayProviders[name] = true
-				}
-			}
-		}
-	}
-	for i := range providerList.Items {
-		if !referencedProviders[providerList.Items[i].GetName()] {
-			continue
-		}
-		var provider v1alpha1.ExternalProvider
-		if err := runtime.DefaultUnstructuredConverter.FromUnstructured(providerList.Items[i].Object, &provider); err != nil {
-			return ctrl.Result{}, fmt.Errorf("decode tenant ExternalProvider %s: %w", providerList.Items[i].GetName(), err)
-		}
-		providers = append(providers, provider)
+	providers, requiredOverlayProviders, err := r.providersForTenant(ctx, tenantNamespace)
+	if err != nil {
+		return ctrl.Result{}, err
 	}
 	praxisImage := r.PraxisImage
 	if praxisImage == "" {
@@ -332,6 +307,103 @@ func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, aiten
 	log.Info("praxis-extproc install applied",
 		"tenantID", tenantID, "namespace", gatewayNamespace, "gatewayName", gatewayName)
 	return ctrl.Result{RequeueAfter: r.ResyncInterval}, nil
+}
+
+// providersForTenant returns the providers referenced by the tenant's models
+// and the subset that must be present in the currently published overlay.
+// Disabled references remain in the static transport set but do not block the
+// Praxis rollout gate.
+func (r *Reconciler) providersForTenant(ctx context.Context, namespace string) ([]v1alpha1.ExternalProvider, map[string]bool, error) {
+	providerList := &unstructured.UnstructuredList{}
+	providerList.SetGroupVersionKind(schema.GroupVersionKind{Group: "inference.opendatahub.io", Version: "v1alpha1", Kind: "ExternalProviderList"})
+	if err := r.Client.List(ctx, providerList, client.InNamespace(namespace)); err != nil {
+		return nil, nil, fmt.Errorf("list tenant ExternalProviders: %w", err)
+	}
+	modelList := &unstructured.UnstructuredList{}
+	modelList.SetGroupVersionKind(schema.GroupVersionKind{Group: "inference.opendatahub.io", Version: "v1alpha1", Kind: "ExternalModelList"})
+	if err := r.Client.List(ctx, modelList, client.InNamespace(namespace)); err != nil {
+		return nil, nil, fmt.Errorf("list tenant ExternalModels: %w", err)
+	}
+	referencedProviders := map[string]bool{}
+	requiredOverlayProviders := map[string]bool{}
+	for i := range modelList.Items {
+		refs, found, err := unstructured.NestedSlice(modelList.Items[i].Object, "spec", "externalProviderRefs")
+		if err != nil {
+			return nil, nil, fmt.Errorf("read provider refs for ExternalModel %s: %w", modelList.Items[i].GetName(), err)
+		}
+		if !found {
+			continue
+		}
+		for _, raw := range refs {
+			ref, ok := raw.(map[string]any)
+			if !ok {
+				return nil, nil, fmt.Errorf("invalid provider ref in ExternalModel %s", modelList.Items[i].GetName())
+			}
+			name, _, err := unstructured.NestedString(ref, "ref", "name")
+			if err != nil {
+				return nil, nil, fmt.Errorf("read provider ref in ExternalModel %s: %w", modelList.Items[i].GetName(), err)
+			}
+			if name == "" {
+				continue
+			}
+			referencedProviders[name] = true
+			weight, found, err := unstructured.NestedInt64(ref, "weight")
+			if err != nil {
+				return nil, nil, fmt.Errorf("read provider weight in ExternalModel %s: %w", modelList.Items[i].GetName(), err)
+			}
+			if !found || weight > 0 {
+				requiredOverlayProviders[name] = true
+			}
+		}
+	}
+	providers := make([]v1alpha1.ExternalProvider, 0, len(providerList.Items))
+	for i := range providerList.Items {
+		if !referencedProviders[providerList.Items[i].GetName()] {
+			continue
+		}
+		var provider v1alpha1.ExternalProvider
+		if err := runtime.DefaultUnstructuredConverter.FromUnstructured(providerList.Items[i].Object, &provider); err != nil {
+			return nil, nil, fmt.Errorf("decode tenant ExternalProvider %s: %w", providerList.Items[i].GetName(), err)
+		}
+		providers = append(providers, provider)
+	}
+	return providers, requiredOverlayProviders, nil
+}
+
+// ippResourcesReleased reads MaaS's explicit handoff boundary. The
+// annotation is accepted for MaaS builds that publish the handoff marker but
+// predate the status condition; current builds publish both signals. A
+// missing or non-true signal always blocks creation of same-named Praxis
+// resources.
+func (r *Reconciler) ippResourcesReleased(ctx context.Context, namespace string) (bool, string, error) {
+	config := maasTenantConfigObject()
+	if err := r.Client.Get(ctx, client.ObjectKey{Namespace: namespace, Name: MaasTenantConfigName}, config); err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, "MaaS tenant configuration is absent", nil
+		}
+		return false, "", fmt.Errorf("get MaaS tenant configuration %s/%s: %w", namespace, MaasTenantConfigName, err)
+	}
+	if config.GetAnnotations()[AnnotationIPPMigrationCleanupComplete] == "true" {
+		return true, "MaaS cleanup marker is true", nil
+	}
+	conditions, found, err := unstructured.NestedSlice(config.Object, "status", "conditions")
+	if err != nil {
+		return false, "MaaS handoff conditions are malformed", fmt.Errorf("read MaaS handoff conditions: %w", err)
+	}
+	if found {
+		for _, raw := range conditions {
+			condition, ok := raw.(map[string]any)
+			if !ok {
+				continue
+			}
+			typeName, _, _ := unstructured.NestedString(condition, "type")
+			status, _, _ := unstructured.NestedString(condition, "status")
+			if typeName == IPPResourcesReleasedCondition && status == "True" {
+				return true, "MaaS IPPResourcesReleased condition is true", nil
+			}
+		}
+	}
+	return false, "MaaS IPPResourcesReleased condition is not true", nil
 }
 
 // routingOverlayReady accepts only the current controller's published
@@ -542,11 +614,13 @@ func (r *Reconciler) cleanup(ctx context.Context, tenantID, gatewayNamespace, te
 		{gvkService, PayloadPreProcessingServiceName(tenantID), gatewayNamespace},
 		{gvkConfigMap, PayloadProcessingPluginsConfigMapForTenant(tenantID), gatewayNamespace},
 		{gvkServiceAccount, PayloadProcessingServiceAccountName(tenantID), gatewayNamespace},
-		{gvkNetworkPolicy, PayloadProcessingNetworkPolicyName(tenantID), gatewayNamespace},
 		{gvkEnvoyFilter, PayloadProcessingEnvoyFilterName(tenantID), gatewayNamespace},
 		{gvkDestinationRule, PayloadProcessingServiceName(tenantID), gatewayNamespace},
 		{gvkDestinationRule, PayloadPreProcessingServiceName(tenantID), gatewayNamespace},
 		{gvkClusterRoleBinding, PayloadProcessingReaderClusterRoleBindingNameForTenant(tenantID), ""},
+		// SkipNetworkPolicy controls creation during reconciliation only. Cleanup
+		// must still inspect and remove a policy this controller previously owned.
+		{gvkNetworkPolicy, PayloadProcessingNetworkPolicyName(tenantID), gatewayNamespace},
 	}
 
 	for _, t := range targets {

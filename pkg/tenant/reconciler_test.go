@@ -56,6 +56,7 @@ func aitenantSchemeForTests() *runtime.Scheme {
 	scheme.AddKnownTypeWithName(AITenantGVK, &unstructured.Unstructured{})
 	listGVK := AITenantGVK.GroupVersion().WithKind(AITenantGVK.Kind + "List")
 	scheme.AddKnownTypeWithName(listGVK, &unstructured.UnstructuredList{})
+	scheme.AddKnownTypeWithName(MaasTenantConfigGVK, &unstructured.Unstructured{})
 	return scheme
 }
 
@@ -88,6 +89,14 @@ func withIPPMigrationCleanupComplete(u *unstructured.Unstructured) *unstructured
 	annotations[AnnotationIPPMigrationCleanupComplete] = "true"
 	u.SetAnnotations(annotations)
 	return u
+}
+
+func readyMaaSTenantConfig(namespace string) *unstructured.Unstructured {
+	config := maasTenantConfigObject()
+	config.SetName(MaasTenantConfigName)
+	config.SetNamespace(namespace)
+	config.SetAnnotations(map[string]string{AnnotationIPPMigrationCleanupComplete: "true"})
+	return config
 }
 
 // recorder captures what Reconciler did against the fake client, split by
@@ -250,7 +259,7 @@ func TestReconcileDefersPraxisDeploymentUntilOverlayExists(t *testing.T) {
 	scheme := aitenantSchemeForTests()
 	aitenant := newAITenant("redteam", PayloadProcessingBackendPraxis, AITenantPhaseActive, "my-gateway", "tenant-ns")
 	rec := &recorder{}
-	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(aitenant).WithInterceptorFuncs(rec.persistingFuncs()).Build()
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(aitenant, readyMaaSTenantConfig("tenant-ns")).WithInterceptorFuncs(rec.persistingFuncs()).Build()
 	r := &Reconciler{Client: fakeClient, ManifestPath: manifestPath, Image: "img", MaaSAPIRouteNameBase: "maas-api-route", ResyncInterval: time.Minute}
 
 	res, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKey{Name: "redteam"}})
@@ -271,12 +280,53 @@ func TestReconcileDefersPraxisDeploymentUntilOverlayExists(t *testing.T) {
 	}
 }
 
+func TestReconcileWaitsForMaaSIPPReleaseBeforeRenderingPraxisResources(t *testing.T) {
+	scheme := aitenantSchemeForTests()
+	aitenant := newAITenant("redteam", PayloadProcessingBackendPraxis, AITenantPhaseActive, "my-gateway", "tenant-ns")
+	rec := &recorder{}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(aitenant).WithInterceptorFuncs(rec.persistingFuncs()).Build()
+	r := &Reconciler{Client: fakeClient, ManifestPath: manifestPath, Image: "img", ResyncInterval: time.Minute}
+
+	res, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKey{Name: "redteam"}})
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if res.RequeueAfter != notReadyRequeueInterval {
+		t.Fatalf("RequeueAfter = %v, want %v", res.RequeueAfter, notReadyRequeueInterval)
+	}
+	var deployment unstructured.Unstructured
+	deployment.SetGroupVersionKind(gvkDeployment)
+	if err := fakeClient.Get(context.Background(), client.ObjectKey{Namespace: "tenant-ns", Name: "praxis-redteam"}, &deployment); !apierrors.IsNotFound(err) {
+		t.Fatalf("Praxis Deployment lookup = %v, want NotFound", err)
+	}
+}
+
+func TestIPPResourcesReleasedAcceptsMaaSStatusCondition(t *testing.T) {
+	scheme := aitenantSchemeForTests()
+	config := maasTenantConfigObject()
+	config.SetName(MaasTenantConfigName)
+	config.SetNamespace("tenant-ns")
+	config.Object["status"] = map[string]any{"conditions": []any{map[string]any{
+		"type": IPPResourcesReleasedCondition, "status": "True",
+	}}}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(config).Build()
+	r := &Reconciler{Client: fakeClient}
+
+	released, reason, err := r.ippResourcesReleased(context.Background(), "tenant-ns")
+	if err != nil {
+		t.Fatalf("ippResourcesReleased: %v", err)
+	}
+	if !released || !strings.Contains(reason, "condition") {
+		t.Fatalf("ippResourcesReleased = %t, %q; want true with condition reason", released, reason)
+	}
+}
+
 func TestReconcileCreatesPraxisDeploymentForValidOverlay(t *testing.T) {
 	requireManifests(t)
 	scheme := aitenantSchemeForTests()
 	aitenant := newAITenant("redteam", PayloadProcessingBackendPraxis, AITenantPhaseActive, "my-gateway", "tenant-ns")
 	rec := &recorder{}
-	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(aitenant, validRoutingOverlay(t, "tenant-ns")).WithInterceptorFuncs(rec.persistingFuncs()).Build()
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(aitenant, readyMaaSTenantConfig("tenant-ns"), validRoutingOverlay(t, "tenant-ns")).WithInterceptorFuncs(rec.persistingFuncs()).Build()
 	r := &Reconciler{Client: fakeClient, ManifestPath: manifestPath, Image: "img", MaaSAPIRouteNameBase: "maas-api-route", ResyncInterval: time.Minute}
 
 	res, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKey{Name: "redteam"}})
@@ -303,6 +353,29 @@ func TestReconcileCreatesPraxisDeploymentForValidOverlay(t *testing.T) {
 		return
 	}
 	t.Fatalf("routing overlay volume missing from Deployment: %#v", volumes)
+}
+
+func TestReconcileOmitsNetworkPolicyWhenExplicitlyConfigured(t *testing.T) {
+	requireManifests(t)
+	scheme := aitenantSchemeForTests()
+	aitenant := newAITenant("redteam", PayloadProcessingBackendPraxis, AITenantPhaseActive, "my-gateway", "tenant-ns")
+	rec := &recorder{}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(
+		aitenant, readyMaaSTenantConfig("tenant-ns"), validRoutingOverlay(t, "tenant-ns"),
+	).WithInterceptorFuncs(rec.funcs()).Build()
+	r := &Reconciler{
+		Client: fakeClient, ManifestPath: manifestPath, Image: "img",
+		MaaSAPIRouteNameBase: "maas-api-route", ResyncInterval: time.Minute,
+		SkipNetworkPolicy: true,
+	}
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKey{Name: "redteam"}}); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	var policy unstructured.Unstructured
+	policy.SetGroupVersionKind(gvkNetworkPolicy)
+	if err := fakeClient.Get(context.Background(), client.ObjectKey{Namespace: "tenant-ns", Name: "payload-processing-redteam"}, &policy); !apierrors.IsNotFound(err) {
+		t.Fatalf("NetworkPolicy lookup = %v, want NotFound", err)
+	}
 }
 
 func TestRoutingOverlayReadyDoesNotRequireDisabledProvider(t *testing.T) {
@@ -355,7 +428,7 @@ func TestReconcileRejectsInvalidOrForeignOverlayForPraxisDeployment(t *testing.T
 			overlay := validRoutingOverlay(t, "tenant-ns")
 			tc.edit(overlay)
 			rec := &recorder{}
-			fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(aitenant, overlay).WithInterceptorFuncs(rec.persistingFuncs()).Build()
+			fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(aitenant, readyMaaSTenantConfig("tenant-ns"), overlay).WithInterceptorFuncs(rec.persistingFuncs()).Build()
 			r := &Reconciler{Client: fakeClient, ManifestPath: manifestPath, Image: "img", MaaSAPIRouteNameBase: "maas-api-route", ResyncInterval: time.Minute}
 			res, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKey{Name: "redteam"}})
 			if err != nil {
@@ -379,7 +452,7 @@ func TestReconcilePreservesExistingPraxisDeploymentUntilOverlayRecovers(t *testi
 	aitenant := newAITenant("redteam", PayloadProcessingBackendPraxis, AITenantPhaseActive, "my-gateway", "tenant-ns")
 	overlay := validRoutingOverlay(t, "tenant-ns")
 	rec := &recorder{}
-	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(aitenant, overlay).WithInterceptorFuncs(rec.persistingFuncs()).Build()
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(aitenant, readyMaaSTenantConfig("tenant-ns"), overlay).WithInterceptorFuncs(rec.persistingFuncs()).Build()
 	r := &Reconciler{Client: fakeClient, ManifestPath: manifestPath, Image: "img", MaaSAPIRouteNameBase: "maas-api-route", ResyncInterval: time.Minute}
 	key := ctrl.Request{NamespacedName: client.ObjectKey{Name: "redteam"}}
 	if _, err := r.Reconcile(context.Background(), key); err != nil {
@@ -586,17 +659,17 @@ func TestReconcileWaitsForMigrationMarkerBeforeApply(t *testing.T) {
 	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(aitenant).WithInterceptorFuncs(rec.funcs()).Build()
 
 	r := &Reconciler{Client: fakeClient, ManifestPath: manifestPath, Image: "img", ResyncInterval: time.Minute}
- 	res, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKey{Name: "redteam"}})
- 	if err != nil {
- 		t.Fatalf("Reconcile: %v", err)
- 	}
- 	if res.RequeueAfter != notReadyRequeueInterval {
- 		t.Fatalf("RequeueAfter = %v, want %v", res.RequeueAfter, notReadyRequeueInterval)
- 	}
- 	names, _, _ := rec.snapshot()
- 	if len(names) != 0 {
- 		t.Fatalf("expected no praxis apply before migration marker, got %v", names)
- 	}
+	res, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKey{Name: "redteam"}})
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if res.RequeueAfter != notReadyRequeueInterval {
+		t.Fatalf("RequeueAfter = %v, want %v", res.RequeueAfter, notReadyRequeueInterval)
+	}
+	names, _, _ := rec.snapshot()
+	if len(names) != 0 {
+		t.Fatalf("expected no praxis apply before migration marker, got %v", names)
+	}
 }
 
 func TestReconcileWaitsForResolvedTenantNamespace(t *testing.T) {
@@ -625,7 +698,7 @@ func TestReconcileAppliesAndRequeuesResyncIntervalForNonDefaultTenant(t *testing
 	scheme := aitenantSchemeForTests()
 	aitenant := withIPPMigrationCleanupComplete(newAITenant("redteam", PayloadProcessingBackendPraxis, AITenantPhaseActive, "my-gateway", "tenant-ns"))
 	rec := &recorder{}
-	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(aitenant, validRoutingOverlay(t, "tenant-ns")).WithInterceptorFuncs(rec.funcs()).Build()
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(aitenant, readyMaaSTenantConfig("tenant-ns"), validRoutingOverlay(t, "tenant-ns")).WithInterceptorFuncs(rec.funcs()).Build()
 
 	const resync = 5 * time.Minute
 	r := &Reconciler{Client: fakeClient, ManifestPath: manifestPath, Image: "img", MaaSAPIRouteNameBase: "maas-api-route", ResyncInterval: resync}
@@ -663,7 +736,7 @@ func TestReconcileAppliesUnsuffixedNamesForDefaultTenant(t *testing.T) {
 	scheme := aitenantSchemeForTests()
 	aitenant := withIPPMigrationCleanupComplete(newAITenant(DefaultAITenantName, PayloadProcessingBackendPraxis, AITenantPhaseActive, "my-gateway", "openshift-ingress"))
 	rec := &recorder{}
-	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(aitenant, validRoutingOverlay(t, "openshift-ingress")).WithInterceptorFuncs(rec.funcs()).Build()
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(aitenant, readyMaaSTenantConfig("openshift-ingress"), validRoutingOverlay(t, "openshift-ingress")).WithInterceptorFuncs(rec.funcs()).Build()
 
 	r := &Reconciler{Client: fakeClient, ManifestPath: manifestPath, Image: "img", MaaSAPIRouteNameBase: "maas-api-route", ResyncInterval: time.Minute}
 	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKey{Name: DefaultAITenantName}}); err != nil {
@@ -795,6 +868,34 @@ func TestReconcileCleanupSkipsMaaSOwnedResources(t *testing.T) {
 	for _, name := range deleted {
 		if name == PayloadProcessingDeploymentName("redteam") {
 			t.Fatalf("should not delete maas-controller-owned %q, got deletes %v", name, deleted)
+		}
+	}
+}
+
+func TestReconcileCleanupRemovesPreviouslyOwnedNetworkPolicyWhenCreationIsSkipped(t *testing.T) {
+	scheme := aitenantSchemeForTests()
+	aitenant := withFinalizer(newAITenant("redteam", "", AITenantPhaseActive, "my-gateway", "tenant-ns"))
+	ownedPolicy := &unstructured.Unstructured{}
+	ownedPolicy.SetGroupVersionKind(gvkNetworkPolicy)
+	ownedPolicy.SetName(PayloadProcessingNetworkPolicyName("redteam"))
+	ownedPolicy.SetNamespace("tenant-ns")
+	ownedPolicy.SetLabels(map[string]string{LabelManagedBy: ManagedByAIGatewayController})
+	foreignPolicy := ownedPolicy.DeepCopy()
+	foreignPolicy.SetName("payload-processing-foreign")
+	foreignPolicy.SetLabels(map[string]string{LabelManagedBy: "other-controller"})
+
+	rec := &recorder{}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(aitenant, ownedPolicy, foreignPolicy).WithInterceptorFuncs(rec.funcs()).Build()
+	r := &Reconciler{Client: fakeClient, SkipNetworkPolicy: true}
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKey{Name: "redteam"}}); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	_, _, deleted := rec.snapshot()
+	assertContains(t, deleted, PayloadProcessingNetworkPolicyName("redteam"))
+	for _, name := range deleted {
+		if name == foreignPolicy.GetName() {
+			t.Fatalf("deleted foreign NetworkPolicy %q", name)
 		}
 	}
 }

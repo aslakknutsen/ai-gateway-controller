@@ -9,6 +9,7 @@ OC=(oc --kubeconfig "${OPENSHIFT_KUBECONFIG:-$STATE/kubeconfig}")
 OUT="$OPENSHIFT_E2E_EVIDENCE_ROOT/provision"
 mkdir -p "$OUT"
 OPENSHIFT_E2E_GATEWAY_TLS_SECRET="xmp-gateway-tls-$OPENSHIFT_E2E_RUN_ID"
+OPENSHIFT_E2E_GATEWAY_CLASS="${OPENSHIFT_E2E_GATEWAY_CLASS:-$(cat "$STATE/istio-gateway-class.txt" 2>/dev/null || printf '%s' istio)}"
 AITENANT_NAME="${OPENSHIFT_E2E_AITENANT_NAME:-models-as-a-service}"
 OPENSHIFT_E2E_USER="${OPENSHIFT_E2E_USER:-$("${OC[@]}" whoami)}"
 
@@ -17,6 +18,7 @@ need docker
 need skopeo
 need sha256sum
 need envsubst
+REQUESTED_CONTROLLER_IMAGE="${OPENSHIFT_E2E_CONTROLLER_IMAGE:-}"
 [[ -n "${PRAXIS_REPO:-}" && -n "${PRAXIS_EXTPROC_REPO:-}" && -n "${MAAS_CONTROLLER_REPO:-}" && -n "${KSERVE_REPO:-}" && -n "${KUADRANT_OPERATOR_REPO:-}" ]] || {
   echo "PRAXIS_REPO, PRAXIS_EXTPROC_REPO, MAAS_CONTROLLER_REPO, KSERVE_REPO, and KUADRANT_OPERATOR_REPO must point to pinned clean checkouts" >&2
   exit 1
@@ -28,6 +30,18 @@ for repo in "${repos[@]}"; do
 done
 git -C "$MAAS_CONTROLLER_REPO" diff --quiet || { echo "refusing dirty MaaS source: $MAAS_CONTROLLER_REPO" >&2; exit 1; }
 git -C "$MAAS_CONTROLLER_REPO" diff --cached --quiet || { echo "refusing staged MaaS source: $MAAS_CONTROLLER_REPO" >&2; exit 1; }
+RESOLVED_CONTROLLER_IMAGE=""
+if [[ -n "$REQUESTED_CONTROLLER_IMAGE" ]]; then
+  if [[ "$REQUESTED_CONTROLLER_IMAGE" == *@sha256:* ]]; then
+    RESOLVED_CONTROLLER_IMAGE="$REQUESTED_CONTROLLER_IMAGE"
+  else
+    CONTROLLER_DIGEST=$(skopeo inspect "docker://$REQUESTED_CONTROLLER_IMAGE" 2>"$OUT/controller-image-resolve.err" | jq -er '.Digest') || {
+      echo "unable to resolve explicit controller image to an immutable digest: $REQUESTED_CONTROLLER_IMAGE; diagnostics: $OUT/controller-image-resolve.err" >&2
+      exit 1
+    }
+    RESOLVED_CONTROLLER_IMAGE="${REQUESTED_CONTROLLER_IMAGE%:*}@$CONTROLLER_DIGEST"
+  fi
+fi
 "$ROOT/test/openshift-env/bootstrap.sh"
 {
   printf 'controller_head '; git -C "$ROOT" rev-parse HEAD
@@ -65,7 +79,7 @@ ensure_shared_ns maas-system
 ensure_shared_ns ai-tenants
 RENDER_DIR="$OUT/rendered-manifests"
 export OPENSHIFT_E2E_RUN_ID OPENSHIFT_E2E_CONTROLLER_NAMESPACE OPENSHIFT_E2E_BACKEND_NAMESPACE
-export OPENSHIFT_E2E_TENANT_NAMESPACE OPENSHIFT_E2E_GATEWAY_NAME OPENSHIFT_E2E_GATEWAY_NAMESPACE
+export OPENSHIFT_E2E_TENANT_NAMESPACE OPENSHIFT_E2E_GATEWAY_NAME OPENSHIFT_E2E_GATEWAY_NAMESPACE OPENSHIFT_E2E_GATEWAY_CLASS
 export OPENSHIFT_E2E_GATEWAY_TLS_SECRET
 # Install the controller's additive development/test CRD package before any
 # fixture is created.  The controller writes observedGeneration and overlay
@@ -115,7 +129,7 @@ REGISTRY=${REGISTRY%/}
 IMAGE_PROJECT=${OPENSHIFT_E2E_IMAGE_PROJECT:-$OPENSHIFT_E2E_BACKEND_NAMESPACE}
 PULL_REGISTRY="image-registry.openshift-image-registry.svc:5000"
 PULL_SECRET="xmp-registry-pull-$OPENSHIFT_E2E_RUN_ID"
-CONTROLLER_IMAGE="${OPENSHIFT_E2E_CONTROLLER_IMAGE:-$PULL_REGISTRY/$IMAGE_PROJECT/ai-gateway-controller:$OPENSHIFT_E2E_RUN_ID}"
+CONTROLLER_IMAGE="${RESOLVED_CONTROLLER_IMAGE:-$PULL_REGISTRY/$IMAGE_PROJECT/ai-gateway-controller:$OPENSHIFT_E2E_RUN_ID}"
 PRAXIS_IMAGE="$PULL_REGISTRY/$IMAGE_PROJECT/praxis-ai:$OPENSHIFT_E2E_RUN_ID"
 EXTPROC_IMAGE="$PULL_REGISTRY/$IMAGE_PROJECT/praxis-extproc:$OPENSHIFT_E2E_RUN_ID"
 KATAN_IMAGE="${KATAN_IMAGE:-ghcr.io/nerdalert/llm-katan@sha256:11379a1ec2fd69dc121eada6c544eb423a7c074414507dc1d474f4abba9df75a}"
@@ -164,6 +178,9 @@ BUILD_FLAGS=(--platform linux/amd64 --provenance=false --sbom=false)
 BUILD_IMAGES=("$CONTROLLER_IMAGE" "$PRAXIS_IMAGE" "$EXTPROC_IMAGE" "$MAAS_API_IMAGE" "$MAAS_CONTROLLER_IMAGE")
 CONTROLLER_IMAGE_EXTERNAL=false
 [[ "$CONTROLLER_IMAGE" == *@sha256:* ]] && CONTROLLER_IMAGE_EXTERNAL=true
+if [[ -n "$REQUESTED_CONTROLLER_IMAGE" ]]; then
+  printf 'requested=%s\nresolved=%s\n' "$REQUESTED_CONTROLLER_IMAGE" "$CONTROLLER_IMAGE" >"$OUT/controller-image-provenance.txt"
+fi
 if [[ "${OPENSHIFT_E2E_REUSE_BUILT_IMAGES:-false}" == true ]]; then
   for image in "${BUILD_IMAGES[@]}"; do
     [[ "$image" == *@sha256:* ]] && continue

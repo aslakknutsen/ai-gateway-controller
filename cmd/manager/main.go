@@ -67,8 +67,8 @@ func main() {
 		"Enable leader election for controller manager. Enable this when running multiple replicas.")
 	flag.StringVar(&image, "image", resolveExtprocImage(),
 		"Container image for the payload-processing and payload-pre-processing Deployments.")
-	flag.StringVar(&praxisImage, "praxis-image", "quay.io/opendatahub/praxis-ai:odh-stable",
-		"Container image for the tenant-scoped standalone Praxis Deployment. Release packaging should replace this default with an immutable digest.")
+	flag.StringVar(&praxisImage, "praxis-image", "",
+		"Required container image for the tenant-scoped standalone Praxis Deployment; provide an immutable digest.")
 	flag.StringVar(&praxisImagePullPolicy, "praxis-image-pull-policy", "IfNotPresent",
 		"Image pull policy for the tenant-scoped standalone Praxis Deployment.")
 	flag.StringVar(&manifestPath, "manifest-path", "/config/manifests/praxis-extproc/overlays/odh",
@@ -126,6 +126,10 @@ func main() {
 
 	if image == "" {
 		setupLog.Error(errors.New("missing required flag"), "--image must be non-empty")
+		os.Exit(1)
+	}
+	if praxisImage == "" {
+		setupLog.Error(errors.New("missing required flag"), "--praxis-image must be non-empty and digest-pinned")
 		os.Exit(1)
 	}
 

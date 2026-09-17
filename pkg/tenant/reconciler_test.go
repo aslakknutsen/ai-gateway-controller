@@ -260,7 +260,7 @@ func TestReconcileDefersPraxisDeploymentUntilOverlayExists(t *testing.T) {
 	aitenant := newAITenant("redteam", PayloadProcessingBackendPraxis, AITenantPhaseActive, "my-gateway", "tenant-ns")
 	rec := &recorder{}
 	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(aitenant, readyMaaSTenantConfig("tenant-ns")).WithInterceptorFuncs(rec.persistingFuncs()).Build()
-	r := &Reconciler{Client: fakeClient, ManifestPath: manifestPath, Image: "img", MaaSAPIRouteNameBase: "maas-api-route", ResyncInterval: time.Minute}
+	r := &Reconciler{Client: fakeClient, ManifestPath: manifestPath, Image: "img", PraxisImage: "test/praxis@sha256:" + strings.Repeat("a", 64), MaaSAPIRouteNameBase: "maas-api-route", ResyncInterval: time.Minute}
 
 	res, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKey{Name: "redteam"}})
 	if err != nil {
@@ -327,7 +327,7 @@ func TestReconcileCreatesPraxisDeploymentForValidOverlay(t *testing.T) {
 	aitenant := newAITenant("redteam", PayloadProcessingBackendPraxis, AITenantPhaseActive, "my-gateway", "tenant-ns")
 	rec := &recorder{}
 	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(aitenant, readyMaaSTenantConfig("tenant-ns"), validRoutingOverlay(t, "tenant-ns")).WithInterceptorFuncs(rec.persistingFuncs()).Build()
-	r := &Reconciler{Client: fakeClient, ManifestPath: manifestPath, Image: "img", MaaSAPIRouteNameBase: "maas-api-route", ResyncInterval: time.Minute}
+	r := &Reconciler{Client: fakeClient, ManifestPath: manifestPath, Image: "img", PraxisImage: "test/praxis@sha256:" + strings.Repeat("a", 64), MaaSAPIRouteNameBase: "maas-api-route", ResyncInterval: time.Minute}
 
 	res, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKey{Name: "redteam"}})
 	if err != nil {
@@ -355,6 +355,20 @@ func TestReconcileCreatesPraxisDeploymentForValidOverlay(t *testing.T) {
 	t.Fatalf("routing overlay volume missing from Deployment: %#v", volumes)
 }
 
+func TestReconcileRejectsMissingPraxisImage(t *testing.T) {
+	requireManifests(t)
+	scheme := aitenantSchemeForTests()
+	aitenant := newAITenant("redteam", PayloadProcessingBackendPraxis, AITenantPhaseActive, "my-gateway", "tenant-ns")
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(
+		aitenant, readyMaaSTenantConfig("tenant-ns"), validRoutingOverlay(t, "tenant-ns"),
+	).Build()
+	r := &Reconciler{Client: fakeClient, ManifestPath: manifestPath, Image: "img", MaaSAPIRouteNameBase: "maas-api-route"}
+	_, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKey{Name: "redteam"}})
+	if err == nil || !strings.Contains(err.Error(), "PraxisImage is required") {
+		t.Fatalf("Reconcile error = %v, want missing PraxisImage error", err)
+	}
+}
+
 func TestReconcileOmitsNetworkPolicyWhenExplicitlyConfigured(t *testing.T) {
 	requireManifests(t)
 	scheme := aitenantSchemeForTests()
@@ -365,6 +379,7 @@ func TestReconcileOmitsNetworkPolicyWhenExplicitlyConfigured(t *testing.T) {
 	).WithInterceptorFuncs(rec.funcs()).Build()
 	r := &Reconciler{
 		Client: fakeClient, ManifestPath: manifestPath, Image: "img",
+		PraxisImage:          "test/praxis@sha256:" + strings.Repeat("a", 64),
 		MaaSAPIRouteNameBase: "maas-api-route", ResyncInterval: time.Minute,
 		SkipNetworkPolicy: true,
 	}
@@ -429,7 +444,7 @@ func TestReconcileRejectsInvalidOrForeignOverlayForPraxisDeployment(t *testing.T
 			tc.edit(overlay)
 			rec := &recorder{}
 			fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(aitenant, readyMaaSTenantConfig("tenant-ns"), overlay).WithInterceptorFuncs(rec.persistingFuncs()).Build()
-			r := &Reconciler{Client: fakeClient, ManifestPath: manifestPath, Image: "img", MaaSAPIRouteNameBase: "maas-api-route", ResyncInterval: time.Minute}
+			r := &Reconciler{Client: fakeClient, ManifestPath: manifestPath, Image: "img", PraxisImage: "test/praxis@sha256:" + strings.Repeat("a", 64), MaaSAPIRouteNameBase: "maas-api-route", ResyncInterval: time.Minute}
 			res, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKey{Name: "redteam"}})
 			if err != nil {
 				t.Fatalf("Reconcile: %v", err)
@@ -453,7 +468,7 @@ func TestReconcilePreservesExistingPraxisDeploymentUntilOverlayRecovers(t *testi
 	overlay := validRoutingOverlay(t, "tenant-ns")
 	rec := &recorder{}
 	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(aitenant, readyMaaSTenantConfig("tenant-ns"), overlay).WithInterceptorFuncs(rec.persistingFuncs()).Build()
-	r := &Reconciler{Client: fakeClient, ManifestPath: manifestPath, Image: "img", MaaSAPIRouteNameBase: "maas-api-route", ResyncInterval: time.Minute}
+	r := &Reconciler{Client: fakeClient, ManifestPath: manifestPath, Image: "img", PraxisImage: "test/praxis@sha256:" + strings.Repeat("a", 64), MaaSAPIRouteNameBase: "maas-api-route", ResyncInterval: time.Minute}
 	key := ctrl.Request{NamespacedName: client.ObjectKey{Name: "redteam"}}
 	if _, err := r.Reconcile(context.Background(), key); err != nil {
 		t.Fatalf("initial Reconcile: %v", err)
@@ -701,7 +716,7 @@ func TestReconcileAppliesAndRequeuesResyncIntervalForNonDefaultTenant(t *testing
 	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(aitenant, readyMaaSTenantConfig("tenant-ns"), validRoutingOverlay(t, "tenant-ns")).WithInterceptorFuncs(rec.funcs()).Build()
 
 	const resync = 5 * time.Minute
-	r := &Reconciler{Client: fakeClient, ManifestPath: manifestPath, Image: "img", MaaSAPIRouteNameBase: "maas-api-route", ResyncInterval: resync}
+	r := &Reconciler{Client: fakeClient, ManifestPath: manifestPath, Image: "img", PraxisImage: "test/praxis@sha256:" + strings.Repeat("a", 64), MaaSAPIRouteNameBase: "maas-api-route", ResyncInterval: resync}
 	res, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKey{Name: "redteam"}})
 	if err != nil {
 		t.Fatalf("Reconcile: %v", err)
@@ -738,7 +753,7 @@ func TestReconcileAppliesUnsuffixedNamesForDefaultTenant(t *testing.T) {
 	rec := &recorder{}
 	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(aitenant, readyMaaSTenantConfig("openshift-ingress"), validRoutingOverlay(t, "openshift-ingress")).WithInterceptorFuncs(rec.funcs()).Build()
 
-	r := &Reconciler{Client: fakeClient, ManifestPath: manifestPath, Image: "img", MaaSAPIRouteNameBase: "maas-api-route", ResyncInterval: time.Minute}
+	r := &Reconciler{Client: fakeClient, ManifestPath: manifestPath, Image: "img", PraxisImage: "test/praxis@sha256:" + strings.Repeat("a", 64), MaaSAPIRouteNameBase: "maas-api-route", ResyncInterval: time.Minute}
 	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKey{Name: DefaultAITenantName}}); err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}

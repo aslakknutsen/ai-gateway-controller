@@ -19,6 +19,7 @@ package tenant
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -253,8 +254,8 @@ func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, aiten
 		return ctrl.Result{}, err
 	}
 	praxisImage := r.PraxisImage
-	if praxisImage == "" {
-		praxisImage = "quay.io/opendatahub/praxis-ai:odh-stable"
+	if strings.TrimSpace(praxisImage) == "" {
+		return ctrl.Result{}, errors.New("PraxisImage is required; configure --praxis-image through release packaging")
 	}
 	praxisResources, err := StandalonePraxisResourcesWithOptions(tenantID, tenantNamespace, praxisImage, r.PraxisImagePullPolicy, providers, PraxisTransportOptions{PlaintextClusters: r.PraxisPlaintextClusters})
 	if err != nil {

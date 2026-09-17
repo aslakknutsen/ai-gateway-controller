@@ -9,7 +9,7 @@ OC=(oc --kubeconfig "${OPENSHIFT_KUBECONFIG:-$STATE/kubeconfig}")
 OUT="$OPENSHIFT_E2E_EVIDENCE_ROOT/provision"
 mkdir -p "$OUT"
 OPENSHIFT_E2E_GATEWAY_TLS_SECRET="xmp-gateway-tls-$OPENSHIFT_E2E_RUN_ID"
-OPENSHIFT_E2E_GATEWAY_CLASS="${OPENSHIFT_E2E_GATEWAY_CLASS:-$(cat "$STATE/istio-gateway-class.txt" 2>/dev/null || printf '%s' istio)}"
+OPENSHIFT_E2E_GATEWAY_CLASS="${OPENSHIFT_E2E_GATEWAY_CLASS:-}"
 AITENANT_NAME="${OPENSHIFT_E2E_AITENANT_NAME:-models-as-a-service}"
 OPENSHIFT_E2E_USER="${OPENSHIFT_E2E_USER:-$("${OC[@]}" whoami)}"
 
@@ -43,6 +43,13 @@ if [[ -n "$REQUESTED_CONTROLLER_IMAGE" ]]; then
   fi
 fi
 "$ROOT/test/openshift-env/bootstrap.sh"
+if [[ -z "$OPENSHIFT_E2E_GATEWAY_CLASS" ]]; then
+  OPENSHIFT_E2E_GATEWAY_CLASS=$(cat "$STATE/istio-gateway-class.txt" 2>/dev/null || true)
+fi
+[[ -n "$OPENSHIFT_E2E_GATEWAY_CLASS" ]] || {
+  echo 'bootstrap did not resolve an OpenShift GatewayClass and no explicit OPENSHIFT_E2E_GATEWAY_CLASS was supplied' >&2
+  exit 1
+}
 {
   printf 'controller_head '; git -C "$ROOT" rev-parse HEAD
   printf 'controller_worktree_diff '; git -C "$ROOT" diff HEAD --binary | sha256sum

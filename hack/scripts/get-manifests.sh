@@ -55,25 +55,24 @@ fetch_praxis_extproc
 # The vendored ExtProc workload reads routing ConfigMaps and inference CRs but
 # does not consume provider Secrets. Credentials are projected only into the
 # tenant-local standalone Praxis workload. Keep this downstream least-privilege
-# adjustment deterministic so regeneration cannot silently restore Secret API
-# access to ExtProc.
+# adjustment structural and fail closed so regeneration cannot silently restore
+# Secret API access to ExtProc.
 cluster_role="${DST_ROOT}/overlays/odh/rbac/clusterrole.yaml"
-tmp_cluster_role=$(mktemp)
-awk '
-  $0 == "  - apiGroups: [\"\"]" {
-    first = $0
-    if ((getline second) <= 0 || (getline third) <= 0) {
-      print first
-      if (second != "") print second
-      if (third != "") print third
-      next
-    }
-    if (second == "    resources: [\"secrets\"]" && third == "    verbs: [\"get\"]") next
-    print first
-    print second
-    print third
-    next
-  }
-  { print }
-' "${cluster_role}" >"${tmp_cluster_role}"
+command -v yq >/dev/null 2>&1 || { echo "yq is required to edit ${cluster_role}" >&2; exit 1; }
+tmp_cluster_role=$(mktemp "${cluster_role}.XXXXXX")
+trap 'rm -f "${tmp_cluster_role:-}"' EXIT
+expected_rule='(.apiGroups == [""] and .resources == ["secrets"] and .verbs == ["get"])'
+rule_count=$(yq eval "[.rules[] | select(${expected_rule})] | length" "${cluster_role}")
+[[ "${rule_count}" == 1 ]] || {
+    echo "refusing RBAC rewrite: expected exactly one core Secret get rule, found ${rule_count}" >&2
+    exit 1
+}
+yq eval "del(.rules[] | select(${expected_rule}))" "${cluster_role}" >"${tmp_cluster_role}"
+remaining_secret_permissions=$(yq eval '[.rules[] | .resources[]? | select(. == "secrets")] | length' "${tmp_cluster_role}")
+[[ "${remaining_secret_permissions}" == 0 ]] || {
+    echo "refusing RBAC rewrite: Secret permission remains after structural edit" >&2
+    exit 1
+}
 mv "${tmp_cluster_role}" "${cluster_role}"
+trap - EXIT
+rm -f "${tmp_cluster_role}"

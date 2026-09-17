@@ -277,6 +277,7 @@ wait_transition_praxis_data_plane() {
 }
 
 "${KCTL[@]}" cluster-info >"$EVIDENCE/cluster-info.txt" 2>&1 || exit 2
+if [[ "$SUITE" != transition ]]; then
 # Keep the run-owned ExternalModel object and its UID across same-cluster
 # repeats. Recreating it changes overlay provenance even when the requested
 # route is semantically identical. The fixture apply below resets its
@@ -392,12 +393,16 @@ route_backend_ns=$(jq -r '.spec.rules[0].backendRefs[0].namespace // .metadata.n
 route_accepted=$(jq -r '[.status.parents[]?.conditions[]? | select(.type == "Accepted" and .status == "True")] | length' <<<"$boundary_route")
 route_refs=$(jq -r '[.status.parents[]?.conditions[]? | select(.type == "ResolvedRefs" and .status == "True")] | length' <<<"$boundary_route")
 gateway_from=$(jq -r '.spec.listeners[0].allowedRoutes.namespaces.from // ""' <<<"$boundary_gateway")
+gateway_selector=$(jq -r '.spec.listeners[0].allowedRoutes.namespaces.selector.matchLabels["local-env.opendatahub.io/gateway-tenant"] // ""' <<<"$boundary_gateway")
+boundary_namespace_label=$("${KCTL[@]}" get namespace "$NS" -o jsonpath='{.metadata.labels.local-env\.opendatahub\.io/gateway-tenant}' 2>/dev/null || true)
 boundary_failures=()
 [[ "$route_parent_ns" == "$GATEWAY_NS" ]] || boundary_failures+=("parent_namespace expected=$GATEWAY_NS actual=$route_parent_ns")
 [[ "$route_backend_ns" == "$NS" ]] || boundary_failures+=("backend_namespace expected=$NS actual=$route_backend_ns")
 [[ "$route_accepted" =~ ^[1-9][0-9]*$ ]] || boundary_failures+=("accepted expected=true actual_count=$route_accepted")
 [[ "$route_refs" =~ ^[1-9][0-9]*$ ]] || boundary_failures+=("resolved_refs expected=true actual_count=$route_refs")
-[[ "$gateway_from" == "All" ]] || boundary_failures+=("allowed_routes expected=All actual=$gateway_from")
+[[ "$gateway_from" == "Selector" ]] || boundary_failures+=("allowed_routes expected=Selector actual=$gateway_from")
+[[ "$gateway_selector" == "$NS" ]] || boundary_failures+=("gateway_selector expected=$NS actual=$gateway_selector")
+[[ "$boundary_namespace_label" == "$NS" ]] || boundary_failures+=("namespace_gateway_label expected=$NS actual=$boundary_namespace_label")
 [[ "$boundary_sa_a" == "no" ]] || boundary_failures+=("secret_api expected=denied actual=$boundary_sa_a")
 [[ "$(jq '.items | length' <<<"$boundary_grants")" == 0 ]] || boundary_failures+=("referencegrant_count expected=0 actual=$(jq '.items | length' <<<"$boundary_grants")")
 if [[ "${#boundary_failures[@]}" == 0 ]]; then
@@ -827,6 +832,7 @@ if [[ "$deletion_ready" == true ]]; then
 else
   record 37 externalmodel_deletion_convergence FAIL null "first_boundary=sibling_externalmodel_not_ready"
 fi
+fi
 
 finalize_results() {
   python3 - "$EVIDENCE/results.json" "$SUITE" <<'PY'
@@ -852,6 +858,12 @@ PY
 if [[ "$SUITE" == routing ]]; then
   finalize_results
   exit 0
+fi
+
+if [[ "$SUITE" == transition ]]; then
+  CA_CERT=$(resolve_maas_api_ca) || { echo "transition suite could not verify the run-owned MaaS API CA" >&2; exit 2; }
+  AUTH_HEADER_FILE=/dev/null
+  request() { timeout 15s curl -sS -D "$EVIDENCE/request-$1.headers" -o "$EVIDENCE/request-$1.body" -w '%{http_code}' "$2" "${@:3}" -H "@${REQUEST_AUTH_HEADER_FILE:-$AUTH_HEADER_FILE}" || echo 000; }
 fi
 
 # Separate transition tenant: absent annotation means MaaS owns the existing IPP path.
@@ -1012,10 +1024,10 @@ if [[ "$cutover_ready" == true && "$ipp_writer_exists" == false ]]; then
   # The transition-only IPP RBAC is separate from the controller's reader
   # binding. Remove it only after the IPP writer has disappeared, so the
   # annotation switch cannot leave a disabled writer with extra permissions.
-  "${KCTL[@]}" delete clusterrolebinding/payload-processing-ipp-reader-transition --ignore-not-found=true --wait=true >/dev/null
-  "${KCTL[@]}" delete clusterrole/payload-processing-ipp-reader-transition --ignore-not-found=true --wait=true >/dev/null
-  if ! "${KCTL[@]}" get clusterrolebinding/payload-processing-ipp-reader-transition >/dev/null 2>&1 && \
-    ! "${KCTL[@]}" get clusterrole/payload-processing-ipp-reader-transition >/dev/null 2>&1; then
+  "${KCTL[@]}" -n ai-tenant-transition delete rolebinding/payload-processing-ipp-reader-transition --ignore-not-found=true --wait=true >/dev/null
+  "${KCTL[@]}" -n ai-tenant-transition delete role/payload-processing-ipp-reader-transition --ignore-not-found=true --wait=true >/dev/null
+  if ! "${KCTL[@]}" -n ai-tenant-transition get rolebinding/payload-processing-ipp-reader-transition >/dev/null 2>&1 && \
+    ! "${KCTL[@]}" -n ai-tenant-transition get role/payload-processing-ipp-reader-transition >/dev/null 2>&1; then
     ipp_rbac_removed=true
   fi
 fi

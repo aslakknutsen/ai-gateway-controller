@@ -34,9 +34,10 @@ metadata:
     maas.opendatahub.io/tenant-namespace: ai-tenant-transition
 ---
 apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
+kind: Role
 metadata:
   name: payload-processing-ipp-reader-transition
+  namespace: ai-tenant-transition
   labels:
     app.kubernetes.io/managed-by: local-env
     maas.opendatahub.io/tenant-namespace: ai-tenant-transition
@@ -87,9 +88,10 @@ rules:
   verbs: [get, list, watch, create, update, delete]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
+kind: RoleBinding
 metadata:
   name: payload-processing-ipp-reader-transition
+  namespace: ai-tenant-transition
   labels:
     app.kubernetes.io/managed-by: local-env
     maas.opendatahub.io/tenant-namespace: ai-tenant-transition
@@ -99,7 +101,7 @@ subjects:
   namespace: maas-system
 roleRef:
   apiGroup: rbac.authorization.k8s.io
-  kind: ClusterRole
+  kind: Role
   name: payload-processing-ipp-reader-transition
 ---
 apiVersion: v1

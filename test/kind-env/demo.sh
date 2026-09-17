@@ -64,6 +64,13 @@ wait_for() {
   done
   echo "  [PASS] $label"
 }
+model_converged() {
+  local namespace=$1 name=$2 phase observed generation
+  phase=$(kctl -n "$namespace" get externalmodel "$name" -o jsonpath='{.status.phase}' 2>/dev/null || true)
+  observed=$(kctl -n "$namespace" get externalmodel "$name" -o jsonpath='{.status.observedGeneration}' 2>/dev/null || true)
+  generation=$(kctl -n "$namespace" get externalmodel "$name" -o jsonpath='{.metadata.generation}' 2>/dev/null || true)
+  [[ "$phase" == Ready && -n "$generation" && "$observed" == "$generation" ]]
+}
 wait_pod_ready() {
   local namespace=$1 name=$2 started now state
   started=$(date +%s)
@@ -138,7 +145,7 @@ if [[ "$RESET" == true ]]; then
   mutate -n "$TENANT" set image deployment/praxis praxis="$praxis_image" >/dev/null
   mutate -n "$TENANT" rollout status deployment/praxis --timeout=120s >/dev/null
   mutate -n "$TENANT" patch externalmodel demo-model --type=json -p='[{"op":"replace","path":"/spec/externalProviderRefs","value":[{"ref":{"name":"provider-a"},"targetModel":"demo","apiFormat":"openai-chat","path":"/v1/chat/completions"}]}]' >/dev/null
-  wait_for "tenant model Ready after reset" 120 kctl -n "$TENANT" get externalmodel demo-model -o jsonpath='{.status.phase}' || exit 1
+  wait_for "tenant model Ready after reset" 120 model_converged "$TENANT" demo-model || exit 1
   for _ in $(seq 1 60); do
     reset_overlay=$(kctl -n "$TENANT" get configmap routing-overlay -o jsonpath='{.data.routing-overlay\.json}' 2>/dev/null || true)
     [[ "$reset_overlay" == *provider-provider-a* && "$reset_overlay" != *provider-provider-b* ]] && break
@@ -209,7 +216,7 @@ before_uid=$(kctl -n "$TENANT" get pod -l app=praxis -o jsonpath='{.items[0].met
 before_restart=$(kctl -n "$TENANT" get pod -l app=praxis -o jsonpath='{.items[0].status.containerStatuses[0].restartCount}')
 before_generation=$(kctl -n "$TENANT" get configmap routing-overlay -o jsonpath='{.metadata.annotations.inference\.opendatahub\.io/routing-overlay-source-generation}')
 mutate -n "$TENANT" patch externalmodel demo-model --type=json -p='[{"op":"replace","path":"/spec/externalProviderRefs","value":[{"ref":{"name":"provider-b"},"targetModel":"demo","apiFormat":"openai-chat","path":"/v1/chat/completions"}]}]' >/dev/null
-wait_for "model Ready after Provider B mutation" 120 kctl -n "$TENANT" get externalmodel demo-model -o jsonpath='{.status.phase}' || fail_stage "model readiness"
+wait_for "model Ready after Provider B mutation" 120 model_converged "$TENANT" demo-model || fail_stage "model readiness"
 new_generation=
 for _ in $(seq 1 60); do
   new_generation=$(kctl -n "$TENANT" get configmap routing-overlay -o jsonpath='{.metadata.annotations.inference\.opendatahub\.io/routing-overlay-source-generation}' 2>/dev/null || true)

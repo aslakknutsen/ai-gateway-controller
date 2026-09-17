@@ -21,6 +21,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/controller-runtime/pkg/source"
 
@@ -53,6 +54,9 @@ const (
 // planes from that same result.
 type Reconciler struct {
 	client.Client
+	// APIReader reads referenced Secret data directly from the API server. The
+	// manager cache only watches Secret metadata to avoid caching credentials.
+	APIReader        client.Reader
 	Scheme           *runtime.Scheme
 	Namespace        string
 	GatewayName      string
@@ -74,25 +78,32 @@ type Reconciler struct {
 // Provider and Secret changes fan out to every affected model in the same
 // namespace; AITenant changes fan out to models in the tenant namespace.
 func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
+	inScope := predicate.NewPredicateFuncs(func(obj client.Object) bool { return r.namespaceAllowed(obj.GetNamespace()) })
 	return builder.ControllerManagedBy(mgr).
-		For(&v1alpha1.ExternalModel{}).
-		Watches(&v1alpha1.ExternalProvider{}, handler.EnqueueRequestsFromMapFunc(r.providerModels)).
-		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.secretModels)).
+		For(&v1alpha1.ExternalModel{}, builder.WithPredicates(inScope)).
+		Watches(&v1alpha1.ExternalProvider{}, handler.EnqueueRequestsFromMapFunc(r.providerModels), builder.WithPredicates(inScope)).
+		WatchesMetadata(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.secretModels), builder.WithPredicates(inScope)).
 		// The tenant reconciler creates the tenant-local Praxis Service. A
 		// model may otherwise publish an HTTPRoute before that Service exists;
 		// Istio can retain ResolvedRefs=False until the route is reconciled
 		// again. Service events are namespace-scoped and therefore only fan out
 		// to models in the affected tenant.
-		Watches(&corev1.Service{}, handler.EnqueueRequestsFromMapFunc(r.serviceModels)).
+		Watches(&corev1.Service{}, handler.EnqueueRequestsFromMapFunc(r.serviceModels), builder.WithPredicates(inScope)).
 		WatchesRawSource(source.Kind(mgr.GetCache(), tenant.NewAITenant(), handler.TypedEnqueueRequestsFromMapFunc[*unstructured.Unstructured, reconcile.Request](r.tenantModels))).
 		Complete(r)
 }
 
 func (r *Reconciler) providerModels(ctx context.Context, obj client.Object) []reconcile.Request {
+	if !r.namespaceAllowed(obj.GetNamespace()) {
+		return nil
+	}
 	return r.modelsReferencingProviders(ctx, obj.GetNamespace(), map[string]bool{obj.GetName(): true})
 }
 
 func (r *Reconciler) secretModels(ctx context.Context, obj client.Object) []reconcile.Request {
+	if !r.namespaceAllowed(obj.GetNamespace()) {
+		return nil
+	}
 	var providers v1alpha1.ExternalProviderList
 	if err := r.List(ctx, &providers, client.InNamespace(obj.GetNamespace())); err != nil {
 		r.Log.Error(err, "list providers for Secret event", "secret", obj.GetName())
@@ -108,6 +119,9 @@ func (r *Reconciler) secretModels(ctx context.Context, obj client.Object) []reco
 }
 
 func (r *Reconciler) serviceModels(ctx context.Context, obj client.Object) []reconcile.Request {
+	if !r.namespaceAllowed(obj.GetNamespace()) {
+		return nil
+	}
 	return r.modelsInNamespace(ctx, obj.GetNamespace())
 }
 
@@ -116,11 +130,14 @@ func (r *Reconciler) tenantModels(ctx context.Context, ait *unstructured.Unstruc
 	if ns == "" {
 		ns = ait.GetNamespace()
 	}
+	if !r.namespaceAllowed(ns) {
+		return nil
+	}
 	return r.modelsInNamespace(ctx, ns)
 }
 
 func (r *Reconciler) modelsInNamespace(ctx context.Context, namespace string) []reconcile.Request {
-	if namespace == "" {
+	if !r.namespaceAllowed(namespace) {
 		return nil
 	}
 	var models v1alpha1.ExternalModelList
@@ -136,7 +153,7 @@ func (r *Reconciler) modelsInNamespace(ctx context.Context, namespace string) []
 }
 
 func (r *Reconciler) modelsReferencingProviders(ctx context.Context, namespace string, providers map[string]bool) []reconcile.Request {
-	if len(providers) == 0 {
+	if len(providers) == 0 || !r.namespaceAllowed(namespace) {
 		return nil
 	}
 	var models v1alpha1.ExternalModelList
@@ -196,6 +213,9 @@ func (r *Reconciler) providerInputs(ctx context.Context, namespace string) (
 // Reconcile applies provider resources, then model routes, then the overlay.
 // The overlay is never published when an earlier stage fails.
 func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {
+	if !r.namespaceAllowed(req.Namespace) {
+		return reconcile.Result{}, nil
+	}
 	var model v1alpha1.ExternalModel
 	if err := r.Get(ctx, req.NamespacedName, &model); err != nil {
 		if apierrors.IsNotFound(err) {
@@ -529,14 +549,21 @@ func (r *Reconciler) validateProvider(ctx context.Context, p *v1alpha1.ExternalP
 	if p.Spec.Auth.SecretRef.Name == "" {
 		return errors.New("auth.secretRef.name is required")
 	}
+	if r.APIReader == nil {
+		return errors.New("APIReader is required for credential Secret reads")
+	}
 	var secret corev1.Secret
-	if err := r.Get(ctx, client.ObjectKey{Namespace: p.Namespace, Name: p.Spec.Auth.SecretRef.Name}, &secret); err != nil {
+	if err := r.APIReader.Get(ctx, client.ObjectKey{Namespace: p.Namespace, Name: p.Spec.Auth.SecretRef.Name}, &secret); err != nil {
 		return fmt.Errorf("credential Secret %s/%s: %w", p.Namespace, p.Spec.Auth.SecretRef.Name, err)
 	}
 	if _, ok := secret.Data["api-key"]; !ok {
 		return fmt.Errorf("credential Secret %s/%s is missing key api-key", p.Namespace, p.Spec.Auth.SecretRef.Name)
 	}
 	return nil
+}
+
+func (r *Reconciler) namespaceAllowed(namespace string) bool {
+	return namespace != "" && (r.Namespace == "" || r.Namespace == namespace)
 }
 
 func (r *Reconciler) applyTransport(ctx context.Context, routes []resolver.Route, modelNamespace, gatewayName,

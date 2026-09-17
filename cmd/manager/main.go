@@ -175,7 +175,7 @@ func main() {
 	}
 
 	modelReconciler := &controller.Reconciler{
-		Client: mgr.GetClient(), Scheme: mgr.GetScheme(), Namespace: externalNamespace,
+		Client: mgr.GetClient(), APIReader: mgr.GetAPIReader(), Scheme: mgr.GetScheme(), Namespace: externalNamespace,
 		GatewayName: gatewayName, GatewayNamespace: gatewayNamespace, Network: network,
 		LocalSite: localSite, KnownClusters: knownClusters,
 		Log: ctrl.Log.WithName("external-model"),

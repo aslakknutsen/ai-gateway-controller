@@ -28,7 +28,10 @@ spec:
       port: 80
       allowedRoutes:
         namespaces:
-          from: All
+          from: Selector
+          selector:
+            matchLabels:
+              local-env.opendatahub.io/gateway-tenant: models-as-a-service
 ---
 apiVersion: v1
 kind: Service
@@ -84,7 +87,10 @@ spec:
     port: 80
     allowedRoutes:
       namespaces:
-        from: All
+        from: Selector
+        selector:
+          matchLabels:
+            local-env.opendatahub.io/gateway-tenant: ai-tenant-tenant-b
 ---
 apiVersion: gateway.networking.k8s.io/v1
 kind: Gateway
@@ -102,7 +108,10 @@ spec:
     port: 80
     allowedRoutes:
       namespaces:
-        from: All
+        from: Selector
+        selector:
+          matchLabels:
+            local-env.opendatahub.io/gateway-tenant: ai-tenant-transition
 ---
 apiVersion: v1
 kind: Service

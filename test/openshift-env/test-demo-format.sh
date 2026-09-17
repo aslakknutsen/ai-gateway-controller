@@ -57,4 +57,9 @@ mv "$TMP/redaction/results.tmp" "$TMP/redaction/results.json"
 redacted_output=$("$DEMO" --evidence "$TMP/redaction")
 if grep -F 'fixture-secret-value' <<<"$redacted_output"; then exit 1; fi
 
+jq '.assertions[0].detail="x-api-key : fixture-secret-value"' "$TMP/redaction/results.json" >"$TMP/redaction/results.tmp"
+mv "$TMP/redaction/results.tmp" "$TMP/redaction/results.json"
+redacted_output=$("$DEMO" --evidence "$TMP/redaction")
+if grep -F 'fixture-secret-value' <<<"$redacted_output"; then exit 1; fi
+
 echo 'demo formatter fixtures: PASS, FAIL, missing evidence, NOT DEMONSTRATED, and redaction passed'

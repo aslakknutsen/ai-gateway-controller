@@ -62,7 +62,7 @@ status_for() {
 }
 detail_for() { jq -r --arg re "$1" '[.assertions[]|select(.name|test($re;"i"))|.detail//empty]|join("; ")' "$RESULTS"; }
 safe() {
-  printf '%s' "$1" | tr '\n' ' ' | sed -E 's/(Authorization:|Bearer[[:space:]]+)[^,; ]+/\1***REDACTED***/Ig; s/(x-api-key|api[_-]?key)[=:][^,; ]+/\1=***REDACTED***/Ig'
+  printf '%s' "$1" | tr '\n' ' ' | sed -E 's/(Authorization[[:space:]]*:|Bearer[[:space:]]+)[^,; ]+/\1 ***REDACTED***/Ig; s/(x-api-key|api[_-]?key)[[:space:]]*[=:][[:space:]]*[^,; ]+/\1=***REDACTED***/Ig'
 }
 detail() { local v; v=$(detail_for "$1"); [[ -n "$v" ]] && safe "$v" || printf 'No matching finalized assertion detail was recorded.'; }
 file_state() { [[ -s "$RUN_ROOT/$1" ]] && printf recorded || printf missing; }

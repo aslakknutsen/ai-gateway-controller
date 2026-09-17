@@ -45,7 +45,7 @@ data:
             clusters:
               - name: provider-transition-provider
                 endpoints: ["provider-a.maas-system.svc.cluster.local:8000"]
-    admin: {address: "127.0.0.1:9901}
+    admin: {address: "127.0.0.1:9901"}
     insecure_options: {allow_private_endpoints: true}
 ---
 apiVersion: apps/v1

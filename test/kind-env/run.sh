@@ -266,7 +266,9 @@ if [[ "${1:---preflight}" == "--provision" ]]; then
   "${KCTL[@]}" create namespace models-as-a-service --dry-run=client -o yaml | "${KCTL[@]}" apply -f -
   "${KCTL[@]}" create namespace ai-tenant-tenant-b --dry-run=client -o yaml | "${KCTL[@]}" apply -f -
   "${KCTL[@]}" create namespace ai-tenant-transition --dry-run=client -o yaml | "${KCTL[@]}" apply -f -
-  "${KCTL[@]}" label namespace ai-tenant-tenant-b ai-gateway.opendatahub.io/tenant=true maas.opendatahub.io/managed-by-aitenant=true --overwrite
+  "${KCTL[@]}" label namespace models-as-a-service local-env.opendatahub.io/gateway-tenant=models-as-a-service --overwrite
+  "${KCTL[@]}" label namespace ai-tenant-tenant-b local-env.opendatahub.io/gateway-tenant=ai-tenant-tenant-b ai-gateway.opendatahub.io/tenant=true maas.opendatahub.io/managed-by-aitenant=true --overwrite
+  "${KCTL[@]}" label namespace ai-tenant-transition local-env.opendatahub.io/gateway-tenant=ai-tenant-transition --overwrite
   "${KCTL[@]}" create namespace ai-tenants --dry-run=client -o yaml | "${KCTL[@]}" apply -f -
   "${KCTL[@]}" apply -f "$ROOT/test/kind-env/manifests/05-database.yaml"
   "${KCTL[@]}" apply -f "$ROOT/test/kind-env/manifests/30-gateway.yaml"

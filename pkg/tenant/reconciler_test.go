@@ -408,6 +408,22 @@ func TestRoutingOverlayReadyDoesNotRequireDisabledProvider(t *testing.T) {
 	}
 }
 
+func TestTenantsForNamespaceMapsExternalModelChanges(t *testing.T) {
+	ait := newAITenant("tenant", PayloadProcessingBackendPraxis, AITenantPhaseActive, "gateway", "tenant-a")
+	ait.SetNamespace("ai-tenants")
+	model := &unstructured.Unstructured{}
+	model.SetGroupVersionKind(schema.GroupVersionKind{Group: "inference.opendatahub.io", Version: "v1alpha1", Kind: "ExternalModel"})
+	model.SetName("demo")
+	model.SetNamespace("tenant-a")
+	fakeClient := fake.NewClientBuilder().WithScheme(aitenantSchemeForTests()).WithObjects(ait, model).Build()
+	r := &Reconciler{Client: fakeClient}
+	requests := r.tenantsForNamespace(context.Background(), model)
+	want := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(ait)}
+	if len(requests) != 1 || requests[0] != want {
+		t.Fatalf("ExternalModel event enqueued %#v, want %#v", requests, want)
+	}
+}
+
 func TestReconcileRejectsInvalidOrForeignOverlayForPraxisDeployment(t *testing.T) {
 	cases := []struct {
 		name string
@@ -415,6 +431,18 @@ func TestReconcileRejectsInvalidOrForeignOverlayForPraxisDeployment(t *testing.T
 	}{
 		{name: "missing data key", edit: func(cm *corev1.ConfigMap) { cm.Data = map[string]string{"other": "value"} }},
 		{name: "malformed JSON", edit: func(cm *corev1.ConfigMap) { cm.Data = map[string]string{praxisOverlayDataKey: "not-json"} }},
+		{name: "unsupported schema version", edit: func(cm *corev1.ConfigMap) {
+			var doc map[string]any
+			if err := json.Unmarshal([]byte(cm.Data[praxisOverlayDataKey]), &doc); err != nil {
+				panic(err)
+			}
+			doc["schema_version"] = "0.0.1"
+			raw, err := json.Marshal(doc)
+			if err != nil {
+				panic(err)
+			}
+			cm.Data[praxisOverlayDataKey] = string(raw)
+		}},
 		{name: "digest mismatch", edit: func(cm *corev1.ConfigMap) {
 			var doc map[string]any
 			if err := json.Unmarshal([]byte(cm.Data[praxisOverlayDataKey]), &doc); err != nil {

@@ -36,9 +36,10 @@ func controllerTestClient(t *testing.T, objects ...client.Object) *Reconciler {
 	if err := v1alpha1.AddToScheme(scheme); err != nil {
 		t.Fatal(err)
 	}
-	return &Reconciler{Client: fake.NewClientBuilder().WithScheme(scheme).
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).
 		WithStatusSubresource(&v1alpha1.ExternalModel{}, &v1alpha1.ExternalProvider{}).
-		WithObjects(objects...).Build()}
+		WithObjects(objects...).Build()
+	return &Reconciler{Client: fakeClient, APIReader: fakeClient}
 }
 
 func nestedSlice(t *testing.T, object map[string]any, fields ...string) []any {
@@ -187,6 +188,40 @@ func TestDependentEventsEnqueueOnlyAffectedNamespaceModels(t *testing.T) {
 	requests = r.secretModels(context.Background(), secret)
 	if len(requests) != 1 || requests[0].NamespacedName != client.ObjectKeyFromObject(modelA) {
 		t.Fatalf("secret event enqueued %#v", requests)
+	}
+}
+
+func TestDependentEventsRespectExternalModelNamespaceScope(t *testing.T) {
+	modelA := &v1alpha1.ExternalModel{ObjectMeta: metav1.ObjectMeta{Name: "a", Namespace: "tenant-a"}}
+	modelB := &v1alpha1.ExternalModel{ObjectMeta: metav1.ObjectMeta{Name: "b", Namespace: "tenant-b"}}
+	providerA := &v1alpha1.ExternalProvider{ObjectMeta: metav1.ObjectMeta{Name: "provider", Namespace: "tenant-a"}}
+	providerB := &v1alpha1.ExternalProvider{ObjectMeta: metav1.ObjectMeta{Name: "provider", Namespace: "tenant-b"}}
+	secretA := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "credentials", Namespace: "tenant-a"}}
+	secretB := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "credentials", Namespace: "tenant-b"}}
+	serviceB := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: "praxis", Namespace: "tenant-b"}}
+	aitenantB := tenant.NewAITenant()
+	aitenantB.SetName("tenant-b")
+	aitenantB.SetNamespace("ai-tenants")
+	aitenantB.Object["status"] = map[string]any{"tenantNamespace": "tenant-b"}
+	r := controllerTestClient(t, modelA, modelB, providerA, providerB, secretA, secretB, serviceB, aitenantB)
+	r.Namespace = "tenant-a"
+	if got := r.providerModels(context.Background(), providerB); len(got) != 0 {
+		t.Fatalf("out-of-scope provider event enqueued %#v", got)
+	}
+	if got := r.secretModels(context.Background(), secretB); len(got) != 0 {
+		t.Fatalf("out-of-scope Secret event enqueued %#v", got)
+	}
+	if got := r.modelsInNamespace(context.Background(), "tenant-b"); len(got) != 0 {
+		t.Fatalf("out-of-scope model list returned %#v", got)
+	}
+	if got := r.serviceModels(context.Background(), serviceB); len(got) != 0 {
+		t.Fatalf("out-of-scope Service event enqueued %#v", got)
+	}
+	if got := r.tenantModels(context.Background(), aitenantB); len(got) != 0 {
+		t.Fatalf("out-of-scope AITenant event enqueued %#v", got)
+	}
+	if _, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(modelB)}); err != nil {
+		t.Fatalf("out-of-scope reconcile returned error: %v", err)
 	}
 }
 

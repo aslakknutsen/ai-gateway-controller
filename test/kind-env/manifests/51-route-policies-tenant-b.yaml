@@ -32,8 +32,6 @@ spec:
           contentType: application/json
           body:
             expression: '{"key": request.headers.authorization.replace("Bearer ", "")}'
-        when:
-        - predicate: auth.identity.matches("^Bearer sk-oai-.*")
     authorization:
       valid-api-key:
         patternMatching:
@@ -41,8 +39,6 @@ spec:
           - operator: eq
             selector: auth.metadata.apiKeyValidation.valid
             value: "true"
-        when:
-        - predicate: auth.identity.matches("^Bearer sk-oai-.*")
   targetRef:
     group: gateway.networking.k8s.io
     kind: HTTPRoute

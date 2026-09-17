@@ -5,7 +5,8 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 STATE=${OPENSHIFT_E2E_STATE:-"$ROOT/.openshift-state"}
 # shellcheck disable=SC1091
 source "$STATE/run.env"
-OC=(timeout --foreground 45s oc --kubeconfig "${OPENSHIFT_KUBECONFIG:-$STATE/kubeconfig}")
+OC=(timeout --foreground "${OPENSHIFT_E2E_OC_POINT_TIMEOUT:-45s}" oc --kubeconfig "${OPENSHIFT_KUBECONFIG:-$STATE/kubeconfig}")
+OC_LONG=(timeout --foreground "${OPENSHIFT_E2E_OC_LONG_TIMEOUT:-300s}" oc --kubeconfig "${OPENSHIFT_KUBECONFIG:-$STATE/kubeconfig}")
 OUT="$OPENSHIFT_E2E_EVIDENCE_ROOT/bootstrap"
 mkdir -p "$OUT"
 
@@ -58,7 +59,7 @@ without_managed_gateway_crds() {
 }
 
 if ! "${OC[@]}" get crd gateways.gateway.networking.k8s.io >/dev/null 2>&1; then
-  "${OC[@]}" apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.5.1/standard-install.yaml >"$OUT/gateway-api-install.log" 2>&1
+  "${OC_LONG[@]}" apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.5.1/standard-install.yaml >"$OUT/gateway-api-install.log" 2>&1
 fi
 "${OC[@]}" get crd gatewayclasses.gateway.networking.k8s.io httproutes.gateway.networking.k8s.io -o name >"$OUT/gateway-api-crds.txt"
 
@@ -116,7 +117,7 @@ if [[ "$(jq 'length' <<<"$EXISTING_ISTIOD")" -ne 0 ]]; then
     }
     printf '%s\n' 'evidence-gated recovery of prior harness Istio installation' >"$OUT/istio-recovery.txt"
     "$ISTIO_CACHE/bin/istioctl" uninstall --purge -y --kubeconfig "${OPENSHIFT_KUBECONFIG:-$STATE/kubeconfig}" >"$OUT/istio-recovery-uninstall.log" 2>&1
-    "${OC[@]}" delete namespace istio-system --ignore-not-found --wait=true --timeout=5m >>"$OUT/istio-recovery-uninstall.log" 2>&1
+    "${OC_LONG[@]}" delete namespace istio-system --ignore-not-found --wait=true --timeout=5m >>"$OUT/istio-recovery-uninstall.log" 2>&1
     EXISTING_ISTIOD='[]'
   fi
   if [[ -z "${OPENSHIFT_E2E_REPAIR_ISTIO_RUN_ID:-}" ]]; then
@@ -149,7 +150,7 @@ else
   ISTIO_ALREADY_INSTALLED=false
 fi
 if [[ "$ISTIO_ALREADY_INSTALLED" == false ]]; then
-"${OC[@]}" apply -f - >"$OUT/istio-scc.log" <<EOF
+"${OC_LONG[@]}" apply -f - >"$OUT/istio-scc.log" <<EOF
 apiVersion: security.openshift.io/v1
 kind: SecurityContextConstraints
 metadata:
@@ -172,7 +173,7 @@ users:
 - system:serviceaccount:istio-system:istio-ingressgateway-service-account
 EOF
 "$ISTIO_CACHE/bin/istioctl" install --kubeconfig "${OPENSHIFT_KUBECONFIG:-$STATE/kubeconfig}" --set profile=minimal --set components.ingressGateways[0].name=istio-ingressgateway --set components.ingressGateways[0].enabled=true --set values.gateways.istio-ingressgateway.autoscaleEnabled=false --set values.gateways.istio-ingressgateway.replicaCount=1 -y >"$OUT/istio.log" 2>&1
-"${OC[@]}" rollout status deployment/istio-ingressgateway -n istio-system --timeout=300s
+"${OC_LONG[@]}" rollout status deployment/istio-ingressgateway -n istio-system --timeout=300s
 fi
 
 # Never repair an unowned Istio webhook in place. A previous installation can
@@ -264,7 +265,7 @@ if ! jq -r '.items[] | . as $c | .webhooks[]? | select((.name // "") | test("val
   exit 1
 fi
 
-if ! "${OC[@]}" apply --dry-run=server -f - >"$ISTIO_CHAIN/admission-dry-run.txt" 2>&1 <<EOF
+if ! "${OC_LONG[@]}" apply --dry-run=server -f - >"$ISTIO_CHAIN/admission-dry-run.txt" 2>&1 <<EOF
 apiVersion: networking.istio.io/v1beta1
 kind: VirtualService
 metadata:
@@ -311,7 +312,7 @@ if "${OC[@]}" get deployment kuadrant-operator-controller-manager -n kuadrant-sy
     exit 1
   fi
 else
-  kustomize build "$KUADRANT_OPERATOR_REPO/config/install/openshift" | pin_kuadrant_catalog_image | normalize_kuadrant_olm | without_managed_gateway_crds | "${OC[@]}" apply -f - >"$OUT/kuadrant-install.log" 2>&1
+  kustomize build "$KUADRANT_OPERATOR_REPO/config/install/openshift" | pin_kuadrant_catalog_image | normalize_kuadrant_olm | without_managed_gateway_crds | "${OC_LONG[@]}" apply -f - >"$OUT/kuadrant-install.log" 2>&1
 fi
 KUADRANT_DEADLINE=$((SECONDS + 300))
 while ! "${OC[@]}" get deployment kuadrant-operator-controller-manager -n kuadrant-system -o json 2>/dev/null | jq -e '.status.availableReplicas >= 1 and .status.readyReplicas >= 1' >/dev/null; do
@@ -388,7 +389,7 @@ fi
 # Kuadrant configuration resources from the pinned checkout.
 if [[ "$KUADRANT_SHARED" == false ]]; then
   for kuadrant_config in authorino.yaml limitador.yaml kuadrant.yaml; do
-    "${OC[@]}" apply -f "$KUADRANT_OPERATOR_REPO/config/install/configure/standard/$kuadrant_config"
+    "${OC_LONG[@]}" apply -f "$KUADRANT_OPERATOR_REPO/config/install/configure/standard/$kuadrant_config"
   done >"$OUT/kuadrant-configure.log" 2>&1
 fi
 if [[ "$KUADRANT_SHARED" == true ]]; then
@@ -444,8 +445,8 @@ fi
 # the controller once, through the normal Deployment lifecycle, so its
 # dependency discovery is deterministic rather than relying on a fixed sleep.
 if [[ "$KUADRANT_SHARED" == false ]]; then
-  "${OC[@]}" rollout restart deployment/kuadrant-operator-controller-manager -n kuadrant-system >"$OUT/kuadrant-restart.log" 2>&1
-  "${OC[@]}" rollout status deployment/kuadrant-operator-controller-manager -n kuadrant-system --timeout=300s >>"$OUT/kuadrant-restart.log" 2>&1
+  "${OC_LONG[@]}" rollout restart deployment/kuadrant-operator-controller-manager -n kuadrant-system >"$OUT/kuadrant-restart.log" 2>&1
+  "${OC_LONG[@]}" rollout status deployment/kuadrant-operator-controller-manager -n kuadrant-system --timeout=300s >>"$OUT/kuadrant-restart.log" 2>&1
 fi
 
 # Authorino can become Ready after the Kuadrant controller has already
@@ -477,7 +478,7 @@ done
 if ((${#KSERVE_MISSING[@]} == 0)); then
   printf 'reused complete ODH-managed KServe CRD set (%s CRDs); no server-side ownership changes\n' "$(wc -w <<<"$KSERVE_CRD_NAMES" | tr -d ' ')" >"$OUT/kserve-crds-shared.txt"
 elif ((${#KSERVE_MISSING[@]} == $(wc -w <<<"$KSERVE_CRD_NAMES" | tr -d ' '))); then
-  kustomize build "$KSERVE_REPO/config/crd/minimal" | "${OC[@]}" apply --server-side -f - >"$OUT/kserve-crds.log" 2>&1
+  kustomize build "$KSERVE_REPO/config/crd/minimal" | "${OC_LONG[@]}" apply --server-side -f - >"$OUT/kserve-crds.log" 2>&1
 else
   printf '%s\n' "${KSERVE_MISSING[@]}" >"$OUT/kserve-crds-partial.txt"
   echo "KServe CRD set is partially present; refusing to adopt or modify shared CRDs: $OUT/kserve-crds-partial.txt" >&2
@@ -489,7 +490,7 @@ fi
 # registry configuration.
 if ! "${OC[@]}" get route "$OPENSHIFT_E2E_REGISTRY_ROUTE" -n openshift-image-registry >/dev/null 2>&1; then
   REGISTRY_SERVICE_CA=$("${OC[@]}" get configmap openshift-service-ca.crt -n openshift-image-registry -o jsonpath='{.data.service-ca\.crt}')
-  "${OC[@]}" apply -f - <<EOF >"$OUT/registry-route.log"
+  "${OC_LONG[@]}" apply -f - <<EOF >"$OUT/registry-route.log"
 apiVersion: route.openshift.io/v1
 kind: Route
 metadata:

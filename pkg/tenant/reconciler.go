@@ -106,8 +106,9 @@ type Reconciler struct {
 func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(NewAITenant()).
+		Watches(&v1alpha1.ExternalModel{}, handler.EnqueueRequestsFromMapFunc(r.tenantsForNamespace)).
 		Watches(&v1alpha1.ExternalProvider{}, handler.EnqueueRequestsFromMapFunc(r.tenantsForNamespace)).
-		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.tenantsForNamespace)).
+		WatchesMetadata(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.tenantsForNamespace)).
 		Watches(maasTenantConfigObject(), handler.EnqueueRequestsFromMapFunc(r.tenantsForNamespace)).
 		Complete(r)
 }
@@ -430,7 +431,7 @@ func (r *Reconciler) routingOverlayReady(ctx context.Context, namespace string, 
 	if decodeErr := json.Unmarshal([]byte(raw), &env); decodeErr != nil {
 		return overlayNotReady("routing overlay is not valid JSON")
 	}
-	if env.SchemaVersion == "" || env.Revision.Value == "" || env.ContentDigest.Value != env.Revision.Value || env.Scope.Namespace != namespace {
+	if env.SchemaVersion != envelope.SchemaVersion || env.Revision.Value == "" || env.ContentDigest.Value != env.Revision.Value || env.Scope.Namespace != namespace {
 		return false, "routing overlay envelope metadata is invalid", nil
 	}
 	digest, digestErr := envelope.ComputeDigestFromWire([]byte(raw))

@@ -654,6 +654,39 @@ func TestReconcileDeleteCleansUpAndRemovesFinalizer(t *testing.T) {
 	}
 }
 
+// TestReconcileDeleteCleansUpWhenAITenantTerminating covers the live
+// swaprace failure: AITenant is already Terminating (not Active) while MTC
+// still carries PraxisCleanupFinalizer. Cleanup must use status.gatewayRef
+// without waiting for Active, or deletion stalls until DeletionTimeout.
+func TestReconcileDeleteCleansUpWhenAITenantTerminating(t *testing.T) {
+	scheme := mtcSchemeForTests()
+	mtc := withMTCFinalizer(newMTC("tenant-ns", "redteam", PayloadProcessingBackendPraxis, "redteam", "ai-tenants"))
+	now := metav1.Now()
+	mtc.SetDeletionTimestamp(&now)
+	aitenant := newAITenantOwner("redteam", "ai-tenants", "Terminating", "my-gateway", "tenant-ns", "tenant-ns")
+	rec := &recorder{}
+	seed := seedPraxisOwnedForCleanup("redteam", "tenant-ns")
+	objs := append([]client.Object{mtc, aitenant}, seed...)
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).WithInterceptorFuncs(rec.funcs()).Build()
+
+	r := &Reconciler{Client: fakeClient, ManifestPath: manifestPath, Image: "img", ResyncInterval: time.Minute, DeletionTimeout: 10 * time.Minute}
+	res, err := r.Reconcile(context.Background(), mtcRequest("tenant-ns"))
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if res.RequeueAfter != 0 {
+		t.Fatalf("RequeueAfter = %v, want 0 (Terminating owner with gatewayRef must still clean up)", res.RequeueAfter)
+	}
+
+	_, mtcPatches, deleted := rec.snapshot()
+	if mtcPatches != 1 {
+		t.Fatalf("mtcPatches = %d, want 1 (removing the cleanup finalizer)", mtcPatches)
+	}
+	for _, want := range expectedCleanupNames("redteam") {
+		assertContains(t, deleted, want)
+	}
+}
+
 func TestReconcileDeleteWithoutFinalizerIsNoop(t *testing.T) {
 	scheme := mtcSchemeForTests()
 	mtc := newMTC("tenant-ns", "redteam", PayloadProcessingBackendPraxis, "redteam", "ai-tenants")

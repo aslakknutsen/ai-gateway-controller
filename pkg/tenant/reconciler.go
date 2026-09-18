@@ -159,32 +159,39 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	return r.reconcilePraxis(ctx, log, mtc, tenantID)
 }
 
-// resolveOwningAITenant Gets the AITenant named by OwningAITenantRef and
-// reports whether it is Active. Annotations alone are not proof of
-// ownership: after Get, status.tenantNamespace must equal mtc's namespace
-// (controller-authored; see ConfigNamespace). A false ready with a
-// nil error and nil aitenant means the annotations aren't populated yet, or
-// the AITenant is gone/not found — a normal transient state during
-// bootstrap or teardown, not an error the caller should fail on. A
-// namespace mismatch is an error so deploy and cleanup paths both refuse
-// to use a spoofed peer AITenant's gatewayRef.
-func (r *Reconciler) resolveOwningAITenant(ctx context.Context, mtc *unstructured.Unstructured) (aitenant *unstructured.Unstructured, ready bool, err error) {
+// resolveOwnedAITenant Gets the AITenant named by OwningAITenantRef and
+// verifies status.tenantNamespace owns mtc. It does not require phase Active:
+// cleanup/delete must still use status.gatewayRef while the AITenant is
+// Terminating (otherwise PraxisCleanupFinalizer blocks MTC deletion until
+// DeletionTimeout). A nil aitenant with a nil error means annotations aren't
+// populated yet or the AITenant is gone — a normal transient state.
+func (r *Reconciler) resolveOwnedAITenant(ctx context.Context, mtc *unstructured.Unstructured) (aitenant *unstructured.Unstructured, err error) {
 	name, namespace, ok := OwningAITenantRef(mtc)
 	if !ok {
-		return nil, false, nil
+		return nil, nil
 	}
 	aitenant = NewAITenant()
 	if err := r.Client.Get(ctx, client.ObjectKey{Name: name, Namespace: namespace}, aitenant); err != nil {
 		if apierrors.IsNotFound(err) {
-			return nil, false, nil
+			return nil, nil
 		}
-		return nil, false, fmt.Errorf("get owning AITenant %s/%s: %w", namespace, name, err)
+		return nil, fmt.Errorf("get owning AITenant %s/%s: %w", namespace, name, err)
 	}
 	ownedNS, ownedOK := ConfigNamespace(aitenant)
 	if !ownedOK || ownedNS != mtc.GetNamespace() {
-		return nil, false, fmt.Errorf(
+		return nil, fmt.Errorf(
 			"AITenant %s/%s status.tenantNamespace %q does not own MaasTenantConfig in %q; refusing spoofed owning-AITenant annotations",
 			namespace, name, ownedNS, mtc.GetNamespace())
+	}
+	return aitenant, nil
+}
+
+// resolveOwningAITenant is resolveOwnedAITenant plus the Active readiness
+// gate used by the praxis apply path.
+func (r *Reconciler) resolveOwningAITenant(ctx context.Context, mtc *unstructured.Unstructured) (aitenant *unstructured.Unstructured, ready bool, err error) {
+	aitenant, err = r.resolveOwnedAITenant(ctx, mtc)
+	if err != nil || aitenant == nil {
+		return aitenant, false, err
 	}
 	if !IsActive(aitenant) {
 		return aitenant, false, nil
@@ -309,12 +316,12 @@ func (r *Reconciler) reconcileNotPraxis(ctx context.Context, log logr.Logger, mt
 		return ctrl.Result{}, nil
 	}
 
-	aitenant, ready, err := r.resolveOwningAITenant(ctx, mtc)
+	aitenant, err := r.resolveOwnedAITenant(ctx, mtc)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	if !ready {
-		log.Info("waiting for owning AITenant to be Active before praxis-extproc cleanup after switch-away")
+	if aitenant == nil {
+		log.Info("waiting for owning AITenant before praxis-extproc cleanup after switch-away")
 		return ctrl.Result{RequeueAfter: notReadyRequeueInterval}, nil
 	}
 	_, gatewayNamespace, gwReady := GatewayRef(aitenant)
@@ -357,12 +364,12 @@ func (r *Reconciler) reconcileDelete(ctx context.Context, log logr.Logger, mtc *
 		return ctrl.Result{}, r.removeFinalizer(ctx, mtc)
 	}
 
-	aitenant, ready, err := r.resolveOwningAITenant(ctx, mtc)
+	aitenant, err := r.resolveOwnedAITenant(ctx, mtc)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	if !ready {
-		log.Info("MaasTenantConfig deleting but owning AITenant is not Active yet; will retry cleanup")
+	if aitenant == nil {
+		log.Info("MaasTenantConfig deleting but owning AITenant is not resolvable yet; will retry cleanup")
 		return ctrl.Result{RequeueAfter: notReadyRequeueInterval}, nil
 	}
 
